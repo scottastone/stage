@@ -1,0 +1,476 @@
+import json
+import os
+import secrets
+import signal
+import socket
+import subprocess
+import sys
+import threading
+import time
+import tomllib
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from urllib import request as urllib_request
+from urllib.error import URLError
+from urllib.parse import quote, unquote
+
+STAGE_DIR = Path.home() / ".stage"
+CONFIG_PATH = Path.home() / ".config" / "stage" / "config.toml"
+PID_FILE = STAGE_DIR / "daemon.pid"
+MANIFEST_FILE = STAGE_DIR / "manifest.json"
+DEFAULT_PORT = 47200
+PROBE_TIMEOUT = 3
+
+
+def main():
+    args = sys.argv[1:]
+    if not args or args[0] in ("-h", "--help"):
+        _usage()
+        return
+
+    cmd = args[0]
+    if cmd == "pull":
+        _pull(args[1] if len(args) > 1 else None)
+    elif cmd == "status":
+        _status(args[1] if len(args) > 1 else None)
+    elif cmd == "clear":
+        _clear()
+    elif cmd == "setup":
+        _setup()
+    elif cmd == "_serve":
+        _run_daemon(int(args[1]), int(args[2]))
+    else:
+        n = 1
+        paths = []
+        i = 0
+        while i < len(args):
+            if args[i] == "-n" and i + 1 < len(args):
+                try:
+                    n = int(args[i + 1])
+                    if n < 1:
+                        raise ValueError
+                except ValueError:
+                    _die(f"Invalid value for -n: {args[i + 1]}")
+                i += 2
+            else:
+                paths.append(args[i])
+                i += 1
+        if not paths:
+            _usage()
+            return
+        _stage(paths, n)
+
+
+def _stage(paths, n=1):
+    files = []
+    for p in paths:
+        path = Path(p).resolve()
+        if not path.exists():
+            _die(f"Not found: {p}")
+        if not path.is_file():
+            _die(f"Not a file: {p}")
+        files.append({"name": path.name, "path": str(path), "size": path.stat().st_size})
+
+    if _is_daemon_running():
+        _die("A staging session is already active. Run 'stage clear' first.")
+
+    config = _load_config()
+    port = int(config["stage"].get("port", DEFAULT_PORT))
+
+    STAGE_DIR.mkdir(parents=True, exist_ok=True)
+    MANIFEST_FILE.write_text(json.dumps({"files": files}, indent=2))
+
+    proc = subprocess.Popen(
+        [sys.executable, "-m", "stage", "_serve", str(port), str(n)],
+        start_new_session=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    PID_FILE.write_text(str(proc.pid))
+
+    for _ in range(20):
+        time.sleep(0.25)
+        try:
+            urllib_request.urlopen(f"http://127.0.0.1:{port}/health", timeout=1)
+            break
+        except Exception:
+            pass
+    else:
+        if not _is_daemon_running():
+            MANIFEST_FILE.unlink(missing_ok=True)
+            PID_FILE.unlink(missing_ok=True)
+            _die(f"Failed to start staging server. Is port {port} already in use?")
+
+    total = sum(f["size"] for f in files)
+    names = ", ".join(f["name"] for f in files)
+    pull_s = "pull" if n == 1 else "pulls"
+    print(f"Staged: {names} ({_human_size(total)}, {n} {pull_s} allowed)")
+    print()
+
+    ts_ip = _tailscale_ip()
+    local_ips = [ip for ip in _local_ips() if ip != ts_ip]
+
+    if ts_ip:
+        print(f"  Via Tailscale:  stage pull")
+    for ip in local_ips:
+        print(f"  Direct:         stage pull {ip}:{port}")
+    if not ts_ip and not local_ips:
+        print(f"  stage pull <this-machine-ip>:{port}")
+
+
+def _run_daemon(port, n):
+    config = _load_config()
+    token = config["stage"]["token"]
+    manifest = json.loads(MANIFEST_FILE.read_text())
+    files = {f["name"]: f["path"] for f in manifest["files"]}
+    pulls_remaining = [n]
+    done_event = threading.Event()
+
+    def _shutdown(sig, frame):
+        done_event.set()
+
+    signal.signal(signal.SIGTERM, _shutdown)
+
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, *args):
+            pass
+
+        def do_GET(self):
+            if self.path == "/health":
+                self._respond(200, "text/plain", b"ok")
+                return
+            if not self._auth():
+                return
+            path = unquote(self.path.lstrip("/"))
+            if path in ("manifest", "status"):
+                body = json.dumps({
+                    "files": list(files.keys()),
+                    "pulls_remaining": pulls_remaining[0],
+                }).encode()
+                self._respond(200, "application/json", body)
+            elif path.startswith("files/"):
+                name = path[6:]
+                if name not in files:
+                    self.send_error(404)
+                    return
+                fp = Path(files[name])
+                if not fp.exists():
+                    self.send_error(410)
+                    return
+                self.send_response(200)
+                self.send_header("Content-Type", "application/octet-stream")
+                self.send_header("Content-Length", str(fp.stat().st_size))
+                self.end_headers()
+                try:
+                    with open(fp, "rb") as f:
+                        while chunk := f.read(65536):
+                            self.wfile.write(chunk)
+                except (BrokenPipeError, ConnectionResetError):
+                    pass
+            else:
+                self.send_error(404)
+
+        def do_POST(self):
+            if not self._auth():
+                return
+            if self.path == "/done":
+                pulls_remaining[0] -= 1
+                remaining = pulls_remaining[0]
+                self._respond(200, "application/json",
+                              json.dumps({"pulls_remaining": remaining}).encode())
+                if remaining <= 0:
+                    done_event.set()
+            elif self.path == "/cancel":
+                self._respond(200, "text/plain", b"cancelled")
+                done_event.set()
+            else:
+                self.send_error(404)
+
+        def _auth(self):
+            if self.headers.get("Authorization") != f"Bearer {token}":
+                self.send_error(401)
+                return False
+            return True
+
+        def _respond(self, code, ctype, body):
+            self.send_response(code)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+    server = ThreadingHTTPServer(("0.0.0.0", port), Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+
+    try:
+        done_event.wait()
+    finally:
+        server.shutdown()
+        MANIFEST_FILE.unlink(missing_ok=True)
+        PID_FILE.unlink(missing_ok=True)
+
+
+def _find_session(host_arg, config, *, quiet=False):
+    """Return (base_url, headers, manifest_data) or None."""
+    token = config["stage"]["token"]
+    port = int(config["stage"].get("port", DEFAULT_PORT))
+    headers = {"Authorization": f"Bearer {token}"}
+
+    if host_arg:
+        base = _base_url(host_arg, port)
+        try:
+            req = urllib_request.Request(f"{base}/manifest", headers=headers)
+            resp = urllib_request.urlopen(req, timeout=PROBE_TIMEOUT)
+            return base, headers, json.loads(resp.read())
+        except Exception:
+            if not quiet:
+                _die(f"No active session reachable at {host_arg}")
+            return None
+
+    peers = _tailscale_peers()
+    if not peers:
+        if not quiet:
+            _die(
+                "No Tailscale peers found.\n"
+                "For a direct connection: stage pull <host>[:<port>]"
+            )
+        return None
+
+    result = [None]
+    lock = threading.Lock()
+
+    def probe(ip):
+        base = f"http://{ip}:{port}"
+        try:
+            req = urllib_request.Request(f"{base}/manifest", headers=headers)
+            resp = urllib_request.urlopen(req, timeout=PROBE_TIMEOUT)
+            data = json.loads(resp.read())
+            with lock:
+                if result[0] is None:
+                    result[0] = (base, headers, data)
+        except Exception:
+            pass
+
+    threads = [threading.Thread(target=probe, args=(ip,), daemon=True) for ip in peers]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=PROBE_TIMEOUT + 1)
+
+    if result[0] is None:
+        if not quiet:
+            _die(
+                "No active staging session found on any Tailscale peer.\n"
+                "For a direct connection: stage pull <host>[:<port>]"
+            )
+        return None
+    return result[0]
+
+
+def _pull(host_arg=None):
+    config = _load_config()
+    session = _find_session(host_arg, config)
+    if session is None:
+        return
+    base, headers, data = session
+
+    file_names = data["files"]
+    if not file_names:
+        print("Nothing staged.")
+        _post(f"{base}/done", headers)
+        return
+
+    cwd = Path.cwd()
+    success = True
+    for name in file_names:
+        dest = _unique_path(cwd / name)
+        encoded = quote(name, safe="")
+        try:
+            req = urllib_request.Request(f"{base}/files/{encoded}", headers=headers)
+            resp = urllib_request.urlopen(req, timeout=300)
+            print(f"Pulling {name}...", end=" ", flush=True)
+            with open(dest, "wb") as f:
+                while chunk := resp.read(65536):
+                    f.write(chunk)
+            print(f"done -> {dest.name}")
+        except URLError as e:
+            print(f"failed: {e}", file=sys.stderr)
+            dest.unlink(missing_ok=True)
+            success = False
+
+    if success:
+        resp = _post(f"{base}/done", headers)
+        remaining = json.loads(resp.read()).get("pulls_remaining", 0)
+        suffix = (
+            f" ({remaining} pull{'s' if remaining != 1 else ''} remaining)"
+            if remaining > 0
+            else " Session closed."
+        )
+        print(f"Pulled {len(file_names)} file(s).{suffix}")
+    else:
+        print("Some files failed. Session remains open for retry.", file=sys.stderr)
+        sys.exit(1)
+
+
+def _status(host_arg=None):
+    config = _load_config()
+    session = _find_session(host_arg, config, quiet=True)
+    if session is None:
+        print("No active staging session found.")
+        return
+    _, _, data = session
+    pulls = data.get("pulls_remaining", "?")
+    files = data["files"]
+    print(f"Active: {len(files)} file(s), {pulls} pull(s) remaining")
+    for name in files:
+        print(f"  {name}")
+
+
+def _clear():
+    if not _is_daemon_running():
+        print("No active staging session.")
+        return
+    pid = int(PID_FILE.read_text().strip())
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+    PID_FILE.unlink(missing_ok=True)
+    MANIFEST_FILE.unlink(missing_ok=True)
+    print("Staging session cleared.")
+
+
+def _setup():
+    CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+
+    existing = {}
+    if CONFIG_PATH.exists():
+        print(f"Config exists at {CONFIG_PATH}")
+        if input("Reconfigure? [y/N] ").strip().lower() != "y":
+            return
+        with open(CONFIG_PATH, "rb") as f:
+            existing = tomllib.load(f)
+
+    cfg = existing.get("stage", {})
+    existing_token = cfg.get("token", "")
+
+    port_input = input(f"Port [{cfg.get('port', DEFAULT_PORT)}]: ").strip()
+    port = int(port_input) if port_input else cfg.get("port", DEFAULT_PORT)
+
+    if existing_token:
+        print(f"Existing token: {existing_token}")
+        if input("Keep existing token? [Y/n] ").strip().lower() == "n":
+            existing_token = ""
+    if not existing_token:
+        existing_token = secrets.token_hex(16)
+        print(f"Generated token: {existing_token}")
+        print("Copy this token when configuring other machines.")
+
+    CONFIG_PATH.write_text(f'[stage]\nport = {port}\ntoken = "{existing_token}"\n')
+    CONFIG_PATH.chmod(0o600)
+    print(f"\nConfig saved to {CONFIG_PATH}")
+
+
+def _base_url(host_str, default_port):
+    if ":" in host_str:
+        h, p = host_str.rsplit(":", 1)
+        return f"http://{h}:{p}"
+    return f"http://{host_str}:{default_port}"
+
+
+def _post(url, headers):
+    req = urllib_request.Request(url, method="POST", headers=headers, data=b"")
+    return urllib_request.urlopen(req, timeout=10)
+
+
+def _tailscale_ip():
+    try:
+        r = subprocess.run(
+            ["tailscale", "ip", "-4"], capture_output=True, text=True, timeout=3
+        )
+        if r.returncode == 0:
+            return r.stdout.strip()
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        pass
+    return None
+
+
+def _tailscale_peers():
+    try:
+        r = subprocess.run(
+            ["tailscale", "status", "--json"], capture_output=True, text=True, timeout=5
+        )
+        if r.returncode != 0:
+            return []
+        data = json.loads(r.stdout)
+        ips = []
+        for peer in data.get("Peer", {}).values():
+            if not peer.get("Online", False):
+                continue
+            for ip in peer.get("TailscaleIPs", []):
+                if ":" not in ip:  # IPv4 only
+                    ips.append(ip)
+                    break
+        return ips
+    except (FileNotFoundError, subprocess.TimeoutExpired, json.JSONDecodeError):
+        return []
+
+
+def _local_ips():
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.connect(("8.8.8.8", 80))
+            return [s.getsockname()[0]]
+    except Exception:
+        return []
+
+
+def _load_config():
+    if not CONFIG_PATH.exists():
+        _die("No config found. Run 'stage setup' first.")
+    with open(CONFIG_PATH, "rb") as f:
+        return tomllib.load(f)
+
+
+def _is_daemon_running():
+    if not PID_FILE.exists():
+        return False
+    try:
+        pid = int(PID_FILE.read_text().strip())
+        os.kill(pid, 0)
+        return True
+    except (ProcessLookupError, OSError, ValueError):
+        return False
+
+
+def _unique_path(path):
+    if not path.exists():
+        return path
+    stem, suffix, parent = path.stem, path.suffix, path.parent
+    for i in range(1, 1000):
+        candidate = parent / f"{stem}_{i}{suffix}"
+        if not candidate.exists():
+            return candidate
+    return path
+
+
+def _human_size(n):
+    for unit in ("B", "KB", "MB", "GB"):
+        if n < 1024:
+            return f"{n:.1f} {unit}"
+        n /= 1024
+    return f"{n:.1f} TB"
+
+
+def _die(msg):
+    print(f"stage: {msg}", file=sys.stderr)
+    sys.exit(1)
+
+
+def _usage():
+    print("Usage:")
+    print("  stage [-n N] <file> [files...]    Stage files (default: 1 pull allowed)")
+    print("  stage pull [<host>[:<port>]]       Pull staged files to current directory")
+    print("  stage status [<host>[:<port>]]     Show active staging session info")
+    print("  stage clear                        Cancel active staging session")
+    print("  stage setup                        Configure port and token")
