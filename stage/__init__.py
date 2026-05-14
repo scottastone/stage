@@ -18,8 +18,10 @@ STAGE_DIR = Path.home() / ".stage"
 CONFIG_PATH = Path.home() / ".config" / "stage" / "config.toml"
 PID_FILE = STAGE_DIR / "daemon.pid"
 MANIFEST_FILE = STAGE_DIR / "manifest.json"
+UPDATE_FILE = STAGE_DIR / "update.json"
 DEFAULT_PORT = 47200
 PROBE_TIMEOUT = 3
+UPDATE_INTERVAL = 86400  # seconds between remote checks
 
 
 def main():
@@ -29,16 +31,28 @@ def main():
         return
 
     cmd = args[0]
+
+    # Internal subcommands — skip everything else
+    if cmd == "_serve":
+        _run_daemon(int(args[1]), int(args[2]))
+        return
+    if cmd == "_check":
+        if len(args) > 1:
+            _do_update_check(args[1])
+        return
+
+    _maybe_check_updates()
+
     if cmd == "pull":
         _pull(args[1] if len(args) > 1 else None)
     elif cmd == "status":
         _status(args[1] if len(args) > 1 else None)
     elif cmd == "clear":
         _clear()
+    elif cmd == "update":
+        _update()
     elif cmd == "setup":
         _setup(args[1:])
-    elif cmd == "_serve":
-        _run_daemon(int(args[1]), int(args[2]))
     else:
         n = 1
         paths = []
@@ -339,6 +353,7 @@ def _clear():
 def _setup(extra_args=None):
     provided_token = None
     provided_port = None
+    provided_repo = None
     args = list(extra_args or [])
     i = 0
     while i < len(args):
@@ -350,6 +365,9 @@ def _setup(extra_args=None):
                 provided_port = int(args[i + 1])
             except ValueError:
                 _die(f"Invalid port: {args[i + 1]}")
+            i += 2
+        elif args[i] == "--repo" and i + 1 < len(args):
+            provided_repo = args[i + 1]
             i += 2
         else:
             _die(f"Unknown argument: {args[i]}")
@@ -388,13 +406,104 @@ def _setup(extra_args=None):
             print("Copy this token when configuring other machines.")
         token = existing_token
 
-    CONFIG_PATH.write_text(f'[stage]\nport = {port}\ntoken = "{token}"\n')
+    if provided_repo is not None:
+        repo = provided_repo
+    elif not non_interactive:
+        existing_repo = existing_cfg.get("repo", "")
+        prompt = f"Repo URL for update checks [{existing_repo}]: " if existing_repo else "Repo URL for update checks (leave blank to skip): "
+        repo_input = input(prompt).strip()
+        repo = repo_input or existing_repo
+    else:
+        repo = existing_cfg.get("repo", "")
+
+    repo_line = f'\nrepo = "{repo}"' if repo else ""
+    CONFIG_PATH.write_text(f'[stage]\nport = {port}\ntoken = "{token}"{repo_line}\n')
     CONFIG_PATH.chmod(0o600)
     print(f"Config saved to {CONFIG_PATH}")
 
     if not non_interactive:
+        repo_flag = f" --repo {repo}" if repo else ""
         print(f"\nTo configure another machine:")
-        print(f"  stage setup --token {token} --port {port}")
+        print(f"  stage setup --token {token} --port {port}{repo_flag}")
+
+
+def _update():
+    result = subprocess.run(["uv", "tool", "upgrade", "stage"])
+    if result.returncode != 0:
+        _die("Update failed. Is 'uv' in your PATH?")
+    # Record installed SHA so the update notice clears
+    try:
+        with open(CONFIG_PATH, "rb") as f:
+            repo = tomllib.load(f).get("stage", {}).get("repo")
+        if repo:
+            sha = _remote_sha(repo)
+            if sha:
+                state = _load_update_state()
+                state.update(installed_sha=sha, latest_sha=sha, last_checked=time.time())
+                _save_update_state(state)
+    except Exception:
+        pass
+
+
+def _maybe_check_updates():
+    if not CONFIG_PATH.exists():
+        return
+    try:
+        with open(CONFIG_PATH, "rb") as f:
+            repo = tomllib.load(f).get("stage", {}).get("repo")
+        if not repo:
+            return
+        state = _load_update_state()
+        if state.get("latest_sha") and state.get("installed_sha") and state["latest_sha"] != state["installed_sha"]:
+            print("A new version of stage is available. Run 'stage update'.", file=sys.stderr)
+        if time.time() - state.get("last_checked", 0) > UPDATE_INTERVAL:
+            subprocess.Popen(
+                [sys.executable, "-m", "stage", "_check", repo],
+                start_new_session=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+    except Exception:
+        pass
+
+
+def _do_update_check(repo):
+    sha = _remote_sha(repo)
+    if sha is None:
+        return
+    state = _load_update_state()
+    state["latest_sha"] = sha
+    state["last_checked"] = time.time()
+    if "installed_sha" not in state:
+        state["installed_sha"] = sha  # first check: baseline, no notice yet
+    _save_update_state(state)
+
+
+def _remote_sha(repo):
+    try:
+        r = subprocess.run(
+            ["git", "ls-remote", repo, "HEAD"],
+            capture_output=True, text=True, timeout=10,
+        )
+        if r.returncode == 0 and r.stdout:
+            return r.stdout.split()[0]
+    except (FileNotFoundError, subprocess.TimeoutExpired, IndexError):
+        pass
+    return None
+
+
+def _load_update_state():
+    try:
+        if UPDATE_FILE.exists():
+            return json.loads(UPDATE_FILE.read_text())
+    except Exception:
+        pass
+    return {}
+
+
+def _save_update_state(state):
+    STAGE_DIR.mkdir(parents=True, exist_ok=True)
+    UPDATE_FILE.write_text(json.dumps(state))
 
 
 def _base_url(host_str, default_port):
@@ -540,4 +649,5 @@ def _usage():
     print("  stage pull [<host>[:<port>]]       Pull staged files to current directory")
     print("  stage status [<host>[:<port>]]     Show active staging session info")
     print("  stage clear                        Cancel active staging session")
-    print("  stage setup                        Configure port and token")
+    print("  stage update                       Upgrade to the latest version")
+    print("  stage setup                        Configure port, token, and repo")
