@@ -36,7 +36,7 @@ def main():
     elif cmd == "clear":
         _clear()
     elif cmd == "setup":
-        _setup()
+        _setup(args[1:])
     elif cmd == "_serve":
         _run_daemon(int(args[1]), int(args[2]))
     else:
@@ -340,35 +340,65 @@ def _clear():
     print("Staging session cleared.")
 
 
-def _setup():
+def _setup(extra_args=None):
+    provided_token = None
+    provided_port = None
+    args = list(extra_args or [])
+    i = 0
+    while i < len(args):
+        if args[i] == "--token" and i + 1 < len(args):
+            provided_token = args[i + 1]
+            i += 2
+        elif args[i] == "--port" and i + 1 < len(args):
+            try:
+                provided_port = int(args[i + 1])
+            except ValueError:
+                _die(f"Invalid port: {args[i + 1]}")
+            i += 2
+        else:
+            _die(f"Unknown argument: {args[i]}")
+
+    non_interactive = provided_token is not None and provided_port is not None
+
     CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
 
-    existing = {}
+    existing_cfg = {}
     if CONFIG_PATH.exists():
-        print(f"Config exists at {CONFIG_PATH}")
-        if input("Reconfigure? [y/N] ").strip().lower() != "y":
-            return
+        if not non_interactive:
+            print(f"Config exists at {CONFIG_PATH}")
+            if input("Reconfigure? [y/N] ").strip().lower() != "y":
+                return
         with open(CONFIG_PATH, "rb") as f:
-            existing = tomllib.load(f)
+            existing_cfg = tomllib.load(f).get("stage", {})
 
-    cfg = existing.get("stage", {})
-    existing_token = cfg.get("token", "")
+    if provided_port is not None:
+        port = provided_port
+    else:
+        default_port = existing_cfg.get("port", DEFAULT_PORT)
+        port_input = input(f"Port [{default_port}]: ").strip()
+        port = int(port_input) if port_input else default_port
 
-    port_input = input(f"Port [{cfg.get('port', DEFAULT_PORT)}]: ").strip()
-    port = int(port_input) if port_input else cfg.get("port", DEFAULT_PORT)
+    if provided_token is not None:
+        token = provided_token
+    else:
+        existing_token = existing_cfg.get("token", "")
+        if existing_token:
+            print(f"Existing token: {existing_token}")
+            if input("Keep existing token? [Y/n] ").strip().lower() == "n":
+                existing_token = ""
+        if not existing_token:
+            existing_token = secrets.token_hex(16)
+            print(f"Generated token: {existing_token}")
+            print("Copy this token when configuring other machines.")
+        token = existing_token
 
-    if existing_token:
-        print(f"Existing token: {existing_token}")
-        if input("Keep existing token? [Y/n] ").strip().lower() == "n":
-            existing_token = ""
-    if not existing_token:
-        existing_token = secrets.token_hex(16)
-        print(f"Generated token: {existing_token}")
-        print("Copy this token when configuring other machines.")
-
-    CONFIG_PATH.write_text(f'[stage]\nport = {port}\ntoken = "{existing_token}"\n')
+    CONFIG_PATH.write_text(f'[stage]\nport = {port}\ntoken = "{token}"\n')
     CONFIG_PATH.chmod(0o600)
-    print(f"\nConfig saved to {CONFIG_PATH}")
+    print(f"Config saved to {CONFIG_PATH}")
+
+    if not non_interactive:
+        print(f"\nTo configure another machine:")
+        print(f"  stage setup --token {token} --port {port}")
 
 
 def _base_url(host_str, default_port):
