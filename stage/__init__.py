@@ -288,13 +288,9 @@ def _pull(host_arg=None):
         try:
             req = urllib_request.Request(f"{base}/files/{encoded}", headers=headers)
             resp = urllib_request.urlopen(req, timeout=300)
-            print(f"Pulling {name}...", end=" ", flush=True)
-            with open(dest, "wb") as f:
-                while chunk := resp.read(65536):
-                    f.write(chunk)
-            print(f"done -> {dest.name}")
+            _download(resp, dest, name)
         except URLError as e:
-            print(f"failed: {e}", file=sys.stderr)
+            print(f"\n{name}: failed: {e}", file=sys.stderr)
             dest.unlink(missing_ok=True)
             success = False
 
@@ -406,6 +402,47 @@ def _base_url(host_str, default_port):
         h, p = host_str.rsplit(":", 1)
         return f"http://{h}:{p}"
     return f"http://{host_str}:{default_port}"
+
+
+def _download(resp, dest, name):
+    total = int(resp.headers.get("Content-Length", 0))
+    downloaded = 0
+    start = time.monotonic()
+    tty = sys.stdout.isatty()
+
+    with open(dest, "wb") as f:
+        while chunk := resp.read(65536):
+            f.write(chunk)
+            downloaded += len(chunk)
+            if tty:
+                elapsed = max(time.monotonic() - start, 1e-9)
+                _render_bar(name, downloaded, total, downloaded / elapsed, end="")
+
+    elapsed = max(time.monotonic() - start, 1e-9)
+    speed = downloaded / elapsed
+    rename = f" -> {dest.name}" if dest.name != name else ""
+
+    if tty:
+        _render_bar(name, downloaded, total or downloaded, speed, suffix=rename, end="\n")
+    else:
+        print(f"{name}: {_human_size(downloaded)} at {_human_size(speed)}/s{rename}")
+
+
+def _render_bar(name, done, total, speed, suffix="", end=""):
+    BAR = 22
+    if total:
+        pct = min(done / total, 1.0)
+        filled = int(BAR * pct)
+        arrow = "" if filled >= BAR else ">"
+        bar = "=" * filled + arrow + " " * (BAR - filled - len(arrow))
+        line = (
+            f"\r{name}  [{bar}]  {pct:3.0%}"
+            f"  {_human_size(done)}/{_human_size(total)}"
+            f"  {_human_size(speed)}/s{suffix}"
+        )
+    else:
+        line = f"\r{name}  {_human_size(done)}  {_human_size(speed)}/s{suffix}"
+    print(line, end=end, flush=True)
 
 
 def _post(url, headers):
