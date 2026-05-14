@@ -144,8 +144,15 @@ def _stage(paths, n=1):
             PID_FILE.unlink(missing_ok=True)
             _die(f"Failed to start staging server. Is port {port} already in use?")
 
+    # Fetch public IP concurrently with the daemon startup wait above
+    pub_ip = [None]
+    if config["stage"].get("public_ip_check"):
+        t = threading.Thread(target=lambda: pub_ip.__setitem__(0, _public_ip()), daemon=True)
+        t.start()
+        t.join(timeout=4)
+
     total = sum(f["size"] for f in files)
-    names = ", ".join(f["name"] for f in files)
+    names = ", ".join(f["name"] + ("/" if f.get("type") == "dir" else "") for f in files)
     pull_s = "pull" if n == 1 else "pulls"
     print(f"Staged: {names} ({_human_size(total)}, {n} {pull_s} allowed)")
     print()
@@ -157,7 +164,9 @@ def _stage(paths, n=1):
         print(f"  Via Tailscale:  stage pull")
     for ip in local_ips:
         print(f"  Direct:         stage pull {ip}:{port}")
-    if not ts_ip and not local_ips:
+    if pub_ip[0]:
+        print(f"  Public IP:      stage pull {pub_ip[0]}:{port}")
+    if not ts_ip and not local_ips and not pub_ip[0]:
         print(f"  stage pull <this-machine-ip>:{port}")
 
 
@@ -342,6 +351,14 @@ def _pull(host_arg=None):
         _post(f"{base}/done", headers)
         return
 
+    from_host = base.removeprefix("http://")
+    print(f"From {from_host}:")
+    for entry in file_entries:
+        indicator = "/" if entry.get("type") == "dir" else ""
+        size_str = f"  {_human_size(entry['size'])}" if "size" in entry else ""
+        print(f"  {entry['name']}{indicator}{size_str}")
+    print()
+
     cwd = Path.cwd()
     success = True
     for entry in file_entries:
@@ -420,6 +437,7 @@ def _setup(extra_args=None):
     provided_token = None
     provided_port = None
     provided_repo = None
+    provided_public_ip = None  # None = not specified, True/False = explicit
     args = list(extra_args or [])
     i = 0
     while i < len(args):
@@ -435,6 +453,9 @@ def _setup(extra_args=None):
         elif args[i] == "--repo" and i + 1 < len(args):
             provided_repo = args[i + 1]
             i += 2
+        elif args[i] == "--public-ip":
+            provided_public_ip = True
+            i += 1
         else:
             _die(f"Unknown argument: {args[i]}")
 
@@ -486,15 +507,27 @@ def _setup(extra_args=None):
     else:
         repo = existing_cfg.get("repo", "")
 
+    if provided_public_ip is not None:
+        public_ip_check = provided_public_ip
+    elif not non_interactive:
+        current = existing_cfg.get("public_ip_check", False)
+        default = "Y/n" if current else "y/N"
+        ans = input(f"Show public IP for internet connections? [{default}]: ").strip().lower()
+        public_ip_check = (ans == "y") if ans else current
+    else:
+        public_ip_check = existing_cfg.get("public_ip_check", False)
+
     repo_line = f'\nrepo = "{repo}"' if repo else ""
-    CONFIG_PATH.write_text(f'[stage]\nport = {port}\ntoken = "{token}"{repo_line}\n')
+    pub_line = f"\npublic_ip_check = true" if public_ip_check else ""
+    CONFIG_PATH.write_text(f'[stage]\nport = {port}\ntoken = "{token}"{repo_line}{pub_line}\n')
     CONFIG_PATH.chmod(0o600)
     print(f"Config saved to {CONFIG_PATH}")
 
     if not non_interactive:
         repo_flag = f" --repo {repo}" if repo else ""
+        pub_flag = " --public-ip" if public_ip_check else ""
         print(f"\nTo configure another machine:")
-        print(f"  stage setup --token {token} --port {port}{repo_flag}")
+        print(f"  stage setup --token {token} --port {port}{repo_flag}{pub_flag}")
 
 
 def _update():
@@ -614,7 +647,9 @@ def _download(resp, dest, name, suffix=None):
         suffix = f" -> {dest.name}" if dest.name != name else ""
 
     if tty:
-        _render_bar(name, downloaded, total or downloaded, speed, suffix=suffix, end="\n")
+        _render_bar(
+            name, downloaded, total or downloaded, speed, suffix=suffix, end="\n"
+        )
     else:
         print(f"{name}: {_human_size(downloaded)} at {_human_size(speed)}/s{suffix}")
 
@@ -697,6 +732,14 @@ def _local_ips():
         return []
 
 
+def _public_ip():
+    try:
+        resp = urllib_request.urlopen("https://api4.ipify.org", timeout=3)
+        return resp.read().decode().strip()
+    except Exception:
+        return None
+
+
 def _load_config():
     if not CONFIG_PATH.exists():
         _die("No config found. Run 'stage setup' first.")
@@ -741,7 +784,7 @@ def _die(msg):
 
 def _usage():
     print("Usage:")
-    print("  stage [-n N] <file> [files...]    Stage files (default: 1 pull allowed)")
+    print("  stage [-n N] <file> [files...]     Stage files (default: 1 pull allowed)")
     print("  stage pull [<host>[:<port>]]       Pull staged files to current directory")
     print("  stage status [<host>[:<port>]]     Show active staging session info")
     print("  stage clear                        Cancel active staging session")
