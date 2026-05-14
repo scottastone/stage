@@ -1,10 +1,13 @@
 import json
 import os
 import secrets
+import shutil
 import signal
 import socket
 import subprocess
 import sys
+import tarfile
+import tempfile
 import threading
 import time
 import tomllib
@@ -81,9 +84,35 @@ def _stage(paths, n=1):
         path = Path(p).resolve()
         if not path.exists():
             _die(f"Not found: {p}")
-        if not path.is_file():
-            _die(f"Not a file: {p}")
-        files.append({"name": path.name, "path": str(path), "size": path.stat().st_size})
+        if path.is_dir():
+            print(f"Archiving {path.name}/...", end=" ", flush=True)
+            STAGE_DIR.mkdir(parents=True, exist_ok=True)
+            tmp = STAGE_DIR / f"_dir_{secrets.token_hex(4)}_{path.name}.tar.gz"
+            with tarfile.open(tmp, "w:gz") as tar:
+                tar.add(path, arcname=path.name)
+            size = tmp.stat().st_size
+            print(f"done ({_human_size(size)})")
+            files.append(
+                {
+                    "name": path.name,
+                    "path": str(tmp),
+                    "size": size,
+                    "type": "dir",
+                    "temp": True,
+                }
+            )
+        elif path.is_file():
+            files.append(
+                {
+                    "name": path.name,
+                    "path": str(path),
+                    "size": path.stat().st_size,
+                    "type": "file",
+                    "temp": False,
+                }
+            )
+        else:
+            _die(f"Not a file or directory: {p}")
 
     if _is_daemon_running():
         _die("A staging session is already active. Run 'stage clear' first.")
@@ -136,7 +165,7 @@ def _run_daemon(port, n):
     config = _load_config()
     token = config["stage"]["token"]
     manifest = json.loads(MANIFEST_FILE.read_text())
-    files = {f["name"]: f["path"] for f in manifest["files"]}
+    entries = {f["name"]: f for f in manifest["files"]}
     pulls_remaining = [n]
     done_event = threading.Event()
 
@@ -157,17 +186,26 @@ def _run_daemon(port, n):
                 return
             path = unquote(self.path.lstrip("/"))
             if path in ("manifest", "status"):
-                body = json.dumps({
-                    "files": list(files.keys()),
-                    "pulls_remaining": pulls_remaining[0],
-                }).encode()
+                body = json.dumps(
+                    {
+                        "files": [
+                            {
+                                "name": e["name"],
+                                "type": e.get("type", "file"),
+                                "size": e["size"],
+                            }
+                            for e in entries.values()
+                        ],
+                        "pulls_remaining": pulls_remaining[0],
+                    }
+                ).encode()
                 self._respond(200, "application/json", body)
             elif path.startswith("files/"):
                 name = path[6:]
-                if name not in files:
+                if name not in entries:
                     self.send_error(404)
                     return
-                fp = Path(files[name])
+                fp = Path(entries[name]["path"])
                 if not fp.exists():
                     self.send_error(410)
                     return
@@ -190,8 +228,11 @@ def _run_daemon(port, n):
             if self.path == "/done":
                 pulls_remaining[0] -= 1
                 remaining = pulls_remaining[0]
-                self._respond(200, "application/json",
-                              json.dumps({"pulls_remaining": remaining}).encode())
+                self._respond(
+                    200,
+                    "application/json",
+                    json.dumps({"pulls_remaining": remaining}).encode(),
+                )
                 if remaining <= 0:
                     done_event.set()
             elif self.path == "/cancel":
@@ -220,6 +261,9 @@ def _run_daemon(port, n):
         done_event.wait()
     finally:
         server.shutdown()
+        for entry in entries.values():
+            if entry.get("temp"):
+                Path(entry["path"]).unlink(missing_ok=True)
         MANIFEST_FILE.unlink(missing_ok=True)
         PID_FILE.unlink(missing_ok=True)
 
@@ -288,37 +332,55 @@ def _pull(host_arg=None):
         return
     base, headers, data = session
 
-    file_names = data["files"]
-    if not file_names:
+    raw = data["files"]
+    # Support both old format (list of strings) and new format (list of dicts)
+    file_entries = [
+        f if isinstance(f, dict) else {"name": f, "type": "file"} for f in raw
+    ]
+    if not file_entries:
         print("Nothing staged.")
         _post(f"{base}/done", headers)
         return
 
     cwd = Path.cwd()
     success = True
-    for name in file_names:
-        dest = _unique_path(cwd / name)
+    for entry in file_entries:
+        name = entry["name"]
+        entry_type = entry.get("type", "file")
         encoded = quote(name, safe="")
         try:
             req = urllib_request.Request(f"{base}/files/{encoded}", headers=headers)
             resp = urllib_request.urlopen(req, timeout=300)
-            _download(resp, dest, name)
-        except URLError as e:
+            if entry_type == "dir":
+                with tempfile.NamedTemporaryFile(suffix=".tar.gz", delete=False) as tmp:
+                    tmp_path = Path(tmp.name)
+                try:
+                    _download(resp, tmp_path, name, suffix="")
+                    target = _unique_path(cwd / name)
+                    _extract_archive(tmp_path, target)
+                    rename = f" -> {target.name}/" if target.name != name else ""
+                    print(f"  extracted {name}/{rename}")
+                finally:
+                    tmp_path.unlink(missing_ok=True)
+            else:
+                dest = _unique_path(cwd / name)
+                _download(resp, dest, name)
+        except (URLError, OSError) as e:
             print(f"\n{name}: failed: {e}", file=sys.stderr)
-            dest.unlink(missing_ok=True)
             success = False
 
     if success:
         resp = _post(f"{base}/done", headers)
         remaining = json.loads(resp.read()).get("pulls_remaining", 0)
+        n = len(file_entries)
         suffix = (
             f" ({remaining} pull{'s' if remaining != 1 else ''} remaining)"
             if remaining > 0
             else " Session closed."
         )
-        print(f"Pulled {len(file_names)} file(s).{suffix}")
+        print(f"Pulled {n} item{'s' if n != 1 else ''}.{suffix}")
     else:
-        print("Some files failed. Session remains open for retry.", file=sys.stderr)
+        print("Some items failed. Session remains open for retry.", file=sys.stderr)
         sys.exit(1)
 
 
@@ -330,10 +392,14 @@ def _status(host_arg=None):
         return
     _, _, data = session
     pulls = data.get("pulls_remaining", "?")
-    files = data["files"]
-    print(f"Active: {len(files)} file(s), {pulls} pull(s) remaining")
-    for name in files:
-        print(f"  {name}")
+    entries = data["files"]
+    print(f"Active: {len(entries)} item(s), {pulls} pull(s) remaining")
+    for e in entries:
+        if isinstance(e, dict):
+            indicator = "/" if e.get("type") == "dir" else ""
+            print(f"  {e['name']}{indicator}  ({_human_size(e['size'])})")
+        else:
+            print(f"  {e}")
 
 
 def _clear():
@@ -410,7 +476,11 @@ def _setup(extra_args=None):
         repo = provided_repo
     elif not non_interactive:
         existing_repo = existing_cfg.get("repo", "")
-        prompt = f"Repo URL for update checks [{existing_repo}]: " if existing_repo else "Repo URL for update checks (leave blank to skip): "
+        prompt = (
+            f"Repo URL for update checks [{existing_repo}]: "
+            if existing_repo
+            else "Repo URL for update checks (leave blank to skip): "
+        )
         repo_input = input(prompt).strip()
         repo = repo_input or existing_repo
     else:
@@ -439,7 +509,9 @@ def _update():
             sha = _remote_sha(repo)
             if sha:
                 state = _load_update_state()
-                state.update(installed_sha=sha, latest_sha=sha, last_checked=time.time())
+                state.update(
+                    installed_sha=sha, latest_sha=sha, last_checked=time.time()
+                )
                 _save_update_state(state)
     except Exception:
         pass
@@ -454,8 +526,15 @@ def _maybe_check_updates():
         if not repo:
             return
         state = _load_update_state()
-        if state.get("latest_sha") and state.get("installed_sha") and state["latest_sha"] != state["installed_sha"]:
-            print("A new version of stage is available. Run 'stage update'.", file=sys.stderr)
+        if (
+            state.get("latest_sha")
+            and state.get("installed_sha")
+            and state["latest_sha"] != state["installed_sha"]
+        ):
+            print(
+                "A new version of stage is available. Run 'stage update'.",
+                file=sys.stderr,
+            )
         if time.time() - state.get("last_checked", 0) > UPDATE_INTERVAL:
             subprocess.Popen(
                 [sys.executable, "-m", "stage", "_check", repo],
@@ -483,7 +562,9 @@ def _remote_sha(repo):
     try:
         r = subprocess.run(
             ["git", "ls-remote", repo, "HEAD"],
-            capture_output=True, text=True, timeout=10,
+            capture_output=True,
+            text=True,
+            timeout=10,
         )
         if r.returncode == 0 and r.stdout:
             return r.stdout.split()[0]
@@ -513,7 +594,7 @@ def _base_url(host_str, default_port):
     return f"http://{host_str}:{default_port}"
 
 
-def _download(resp, dest, name):
+def _download(resp, dest, name, suffix=None):
     total = int(resp.headers.get("Content-Length", 0))
     downloaded = 0
     start = time.monotonic()
@@ -529,12 +610,27 @@ def _download(resp, dest, name):
 
     elapsed = max(time.monotonic() - start, 1e-9)
     speed = downloaded / elapsed
-    rename = f" -> {dest.name}" if dest.name != name else ""
+    if suffix is None:
+        suffix = f" -> {dest.name}" if dest.name != name else ""
 
     if tty:
-        _render_bar(name, downloaded, total or downloaded, speed, suffix=rename, end="\n")
+        _render_bar(name, downloaded, total or downloaded, speed, suffix=suffix, end="\n")
     else:
-        print(f"{name}: {_human_size(downloaded)} at {_human_size(speed)}/s{rename}")
+        print(f"{name}: {_human_size(downloaded)} at {_human_size(speed)}/s{suffix}")
+
+
+def _extract_archive(archive_path, target):
+    """Extract a tar.gz so its root directory lands at target."""
+    with tempfile.TemporaryDirectory() as tmp:
+        with tarfile.open(archive_path, "r:gz") as tar:
+            tar.extractall(tmp, filter="data")
+        items = list(Path(tmp).iterdir())
+        if len(items) == 1 and items[0].is_dir():
+            shutil.move(str(items[0]), str(target))
+        else:
+            target.mkdir(parents=True, exist_ok=True)
+            for item in items:
+                shutil.move(str(item), str(target / item.name))
 
 
 def _render_bar(name, done, total, speed, suffix="", end=""):
