@@ -655,12 +655,14 @@ def _download(resp, dest, name, suffix=None):
 
 
 def _tar_filter(member, dest_path):
-    # Use data_filter for path traversal / special file protection, but allow
-    # absolute symlinks (e.g. .venv/bin/python -> /usr/bin/python3.14).
+    # Use data_filter for path traversal / special file protection, but skip
+    # symlinks that point to absolute or out-of-destination paths -- these are
+    # system-specific (e.g. .venv/bin/python -> /usr/bin/python3.14) and would
+    # be broken on a different machine anyway.
     try:
         return tarfile.data_filter(member, dest_path)
-    except tarfile.AbsoluteLinkError:
-        return member
+    except (tarfile.AbsoluteLinkError, tarfile.LinkOutsideDestinationError):
+        return None
 
 
 def _extract_archive(archive_path, target):
