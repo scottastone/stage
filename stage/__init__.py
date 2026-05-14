@@ -654,11 +654,20 @@ def _download(resp, dest, name, suffix=None):
         print(f"{name}: {_human_size(downloaded)} at {_human_size(speed)}/s{suffix}")
 
 
+def _tar_filter(member, dest_path):
+    # Use data_filter for path traversal / special file protection, but allow
+    # absolute symlinks (e.g. .venv/bin/python -> /usr/bin/python3.14).
+    try:
+        return tarfile.data_filter(member, dest_path)
+    except tarfile.AbsoluteLinkError:
+        return member
+
+
 def _extract_archive(archive_path, target):
     """Extract a tar.gz so its root directory lands at target."""
     with tempfile.TemporaryDirectory() as tmp:
         with tarfile.open(archive_path, "r:gz") as tar:
-            tar.extractall(tmp, filter="data")
+            tar.extractall(tmp, filter=_tar_filter)
         items = list(Path(tmp).iterdir())
         if len(items) == 1 and items[0].is_dir():
             shutil.move(str(items[0]), str(target))
