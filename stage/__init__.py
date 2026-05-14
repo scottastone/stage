@@ -1,5 +1,6 @@
 import json
 import os
+import re
 import secrets
 import shutil
 import signal
@@ -17,6 +18,12 @@ from urllib import request as urllib_request
 from urllib.error import URLError
 from urllib.parse import quote, unquote
 
+from rich.console import Console
+from rich.panel import Panel
+from rich.status import Status
+from rich.table import Table
+from tqdm import tqdm
+
 STAGE_DIR = Path.home() / ".stage"
 CONFIG_PATH = Path.home() / ".config" / "stage" / "config.toml"
 PID_FILE = STAGE_DIR / "daemon.pid"
@@ -24,7 +31,10 @@ MANIFEST_FILE = STAGE_DIR / "manifest.json"
 UPDATE_FILE = STAGE_DIR / "update.json"
 DEFAULT_PORT = 47200
 PROBE_TIMEOUT = 3
-UPDATE_INTERVAL = 86400  # seconds between remote checks
+UPDATE_INTERVAL = 86400
+
+console = Console()
+err_console = Console(stderr=True)
 
 
 def main():
@@ -35,7 +45,6 @@ def main():
 
     cmd = args[0]
 
-    # Internal subcommands — skip everything else
     if cmd == "_serve":
         _run_daemon(int(args[1]), int(args[2]))
         return
@@ -56,6 +65,8 @@ def main():
         _update()
     elif cmd == "setup":
         _setup(args[1:])
+    elif cmd == "provision":
+        _provision()
     else:
         n = 1
         paths = []
@@ -85,13 +96,15 @@ def _stage(paths, n=1):
         if not path.exists():
             _die(f"Not found: {p}")
         if path.is_dir():
-            print(f"Archiving {path.name}/...", end=" ", flush=True)
             STAGE_DIR.mkdir(parents=True, exist_ok=True)
             tmp = STAGE_DIR / f"_dir_{secrets.token_hex(4)}_{path.name}.tar.gz"
-            with tarfile.open(tmp, "w:gz") as tar:
-                tar.add(path, arcname=path.name)
+            with Status(f"Archiving [bold]{path.name}/[/bold]...", console=console):
+                with tarfile.open(tmp, "w:gz") as tar:
+                    tar.add(path, arcname=path.name)
             size = tmp.stat().st_size
-            print(f"done ({_human_size(size)})")
+            console.print(
+                f"Archived [bold]{path.name}/[/bold] ([cyan]{_human_size(size)}[/cyan])"
+            )
             files.append(
                 {
                     "name": path.name,
@@ -144,30 +157,34 @@ def _stage(paths, n=1):
             PID_FILE.unlink(missing_ok=True)
             _die(f"Failed to start staging server. Is port {port} already in use?")
 
-    # Fetch public IP concurrently with the daemon startup wait above
     pub_ip = [None]
     if config["stage"].get("public_ip_check"):
-        t = threading.Thread(target=lambda: pub_ip.__setitem__(0, _public_ip()), daemon=True)
+        t = threading.Thread(
+            target=lambda: pub_ip.__setitem__(0, _public_ip()), daemon=True
+        )
         t.start()
         t.join(timeout=4)
 
     total = sum(f["size"] for f in files)
-    names = ", ".join(f["name"] + ("/" if f.get("type") == "dir" else "") for f in files)
+    names = ", ".join(
+        f["name"] + ("/" if f.get("type") == "dir" else "") for f in files
+    )
     pull_s = "pull" if n == 1 else "pulls"
-    print(f"Staged: {names} ({_human_size(total)}, {n} {pull_s} allowed)")
-    print()
+    console.print(
+        f"\nStaged: [bold]{names}[/bold] ([cyan]{_human_size(total)}[/cyan], {n} {pull_s} allowed)\n"
+    )
 
     ts_ip = _tailscale_ip()
     local_ips = [ip for ip in _local_ips() if ip != ts_ip]
 
     if ts_ip:
-        print(f"  Via Tailscale:  stage pull")
+        console.print(f"  Via Tailscale:  [bold]stage pull[/bold]")
     for ip in local_ips:
-        print(f"  Direct:         stage pull {ip}:{port}")
+        console.print(f"  Direct:         [bold]stage pull {ip}:{port}[/bold]")
     if pub_ip[0]:
-        print(f"  Public IP:      stage pull {pub_ip[0]}:{port}")
+        console.print(f"  Public IP:      [bold]stage pull {pub_ip[0]}:{port}[/bold]")
     if not ts_ip and not local_ips and not pub_ip[0]:
-        print(f"  stage pull <this-machine-ip>:{port}")
+        console.print(f"  [bold]stage pull <this-machine-ip>:{port}[/bold]")
 
 
 def _run_daemon(port, n):
@@ -342,22 +359,24 @@ def _pull(host_arg=None):
     base, headers, data = session
 
     raw = data["files"]
-    # Support both old format (list of strings) and new format (list of dicts)
     file_entries = [
         f if isinstance(f, dict) else {"name": f, "type": "file"} for f in raw
     ]
     if not file_entries:
-        print("Nothing staged.")
+        console.print("Nothing staged.")
         _post(f"{base}/done", headers)
         return
 
     from_host = base.removeprefix("http://")
-    print(f"From {from_host}:")
+    table = Table(show_header=False, box=None, padding=(0, 2))
+    table.add_column()
+    table.add_column(justify="right", style="cyan")
     for entry in file_entries:
         indicator = "/" if entry.get("type") == "dir" else ""
-        size_str = f"  {_human_size(entry['size'])}" if "size" in entry else ""
-        print(f"  {entry['name']}{indicator}{size_str}")
-    print()
+        size_str = _human_size(entry["size"]) if "size" in entry else ""
+        table.add_row(f"{entry['name']}{indicator}", size_str)
+    console.print(f"From [bold]{from_host}[/bold]:")
+    console.print(table)
 
     cwd = Path.cwd()
     success = True
@@ -376,14 +395,14 @@ def _pull(host_arg=None):
                     target = _unique_path(cwd / name)
                     _extract_archive(tmp_path, target)
                     rename = f" -> {target.name}/" if target.name != name else ""
-                    print(f"  extracted {name}/{rename}")
+                    console.print(f"  extracted [bold]{name}/[/bold]{rename}")
                 finally:
                     tmp_path.unlink(missing_ok=True)
             else:
                 dest = _unique_path(cwd / name)
                 _download(resp, dest, name)
         except (URLError, OSError) as e:
-            print(f"\n{name}: failed: {e}", file=sys.stderr)
+            err_console.print(f"\n[red]{name}: failed: {e}[/red]")
             success = False
 
     if success:
@@ -391,13 +410,15 @@ def _pull(host_arg=None):
         remaining = json.loads(resp.read()).get("pulls_remaining", 0)
         n = len(file_entries)
         suffix = (
-            f" ({remaining} pull{'s' if remaining != 1 else ''} remaining)"
+            f" ([dim]{remaining} pull{'s' if remaining != 1 else ''} remaining[/dim])"
             if remaining > 0
-            else " Session closed."
+            else " [dim]Session closed.[/dim]"
         )
-        print(f"Pulled {n} item{'s' if n != 1 else ''}.{suffix}")
+        console.print(f"\nPulled [bold]{n}[/bold] item{'s' if n != 1 else ''}.{suffix}")
     else:
-        print("Some items failed. Session remains open for retry.", file=sys.stderr)
+        err_console.print(
+            "[red]Some items failed. Session remains open for retry.[/red]"
+        )
         sys.exit(1)
 
 
@@ -405,23 +426,29 @@ def _status(host_arg=None):
     config = _load_config()
     session = _find_session(host_arg, config, quiet=True)
     if session is None:
-        print("No active staging session found.")
+        console.print("No active staging session found.")
         return
     _, _, data = session
     pulls = data.get("pulls_remaining", "?")
     entries = data["files"]
-    print(f"Active: {len(entries)} item(s), {pulls} pull(s) remaining")
+    console.print(
+        f"[bold]Active:[/bold] {len(entries)} item(s), {pulls} pull(s) remaining"
+    )
+    table = Table(show_header=False, box=None, padding=(0, 2))
+    table.add_column()
+    table.add_column(justify="right", style="cyan")
     for e in entries:
         if isinstance(e, dict):
             indicator = "/" if e.get("type") == "dir" else ""
-            print(f"  {e['name']}{indicator}  ({_human_size(e['size'])})")
+            table.add_row(f"{e['name']}{indicator}", _human_size(e["size"]))
         else:
-            print(f"  {e}")
+            table.add_row(str(e), "")
+    console.print(table)
 
 
 def _clear():
     if not _is_daemon_running():
-        print("No active staging session.")
+        console.print("No active staging session.")
         return
     pid = int(PID_FILE.read_text().strip())
     try:
@@ -430,14 +457,14 @@ def _clear():
         pass
     PID_FILE.unlink(missing_ok=True)
     MANIFEST_FILE.unlink(missing_ok=True)
-    print("Staging session cleared.")
+    console.print("Staging session cleared.")
 
 
 def _setup(extra_args=None):
     provided_token = None
     provided_port = None
     provided_repo = None
-    provided_public_ip = None  # None = not specified, True/False = explicit
+    provided_public_ip = None
     args = list(extra_args or [])
     i = 0
     while i < len(args):
@@ -512,14 +539,20 @@ def _setup(extra_args=None):
     elif not non_interactive:
         current = existing_cfg.get("public_ip_check", False)
         default = "Y/n" if current else "y/N"
-        ans = input(f"Show public IP for internet connections? [{default}]: ").strip().lower()
+        ans = (
+            input(f"Show public IP for internet connections? [{default}]: ")
+            .strip()
+            .lower()
+        )
         public_ip_check = (ans == "y") if ans else current
     else:
         public_ip_check = existing_cfg.get("public_ip_check", False)
 
     repo_line = f'\nrepo = "{repo}"' if repo else ""
     pub_line = f"\npublic_ip_check = true" if public_ip_check else ""
-    CONFIG_PATH.write_text(f'[stage]\nport = {port}\ntoken = "{token}"{repo_line}{pub_line}\n')
+    CONFIG_PATH.write_text(
+        f'[stage]\nport = {port}\ntoken = "{token}"{repo_line}{pub_line}\n'
+    )
     CONFIG_PATH.chmod(0o600)
     print(f"Config saved to {CONFIG_PATH}")
 
@@ -531,23 +564,110 @@ def _setup(extra_args=None):
 
 
 def _update():
+    state = _load_update_state()
+    old_sha = state.get("installed_sha")
+
+    console.print("Upgrading [bold]stage[/bold]...")
     result = subprocess.run(["uv", "tool", "upgrade", "stage"])
     if result.returncode != 0:
         _die("Update failed. Is 'uv' in your PATH?")
-    # Record installed SHA so the update notice clears
+
     try:
         with open(CONFIG_PATH, "rb") as f:
             repo = tomllib.load(f).get("stage", {}).get("repo")
         if repo:
-            sha = _remote_sha(repo)
-            if sha:
+            new_sha = _remote_sha(repo)
+            if new_sha:
                 state = _load_update_state()
                 state.update(
-                    installed_sha=sha, latest_sha=sha, last_checked=time.time()
+                    installed_sha=new_sha, latest_sha=new_sha, last_checked=time.time()
                 )
                 _save_update_state(state)
+                if old_sha and old_sha != new_sha:
+                    changes = _github_changelog(repo, old_sha, new_sha)
+                    if changes:
+                        console.print(
+                            Panel(
+                                changes,
+                                title="[bold green]What's new[/bold green]",
+                                border_style="green",
+                            )
+                        )
     except Exception:
         pass
+
+
+def _provision():
+    config = _load_config()
+    cfg = config["stage"]
+    token = cfg["token"]
+    port = cfg.get("port", DEFAULT_PORT)
+    repo = cfg.get("repo", "")
+    public_ip = cfg.get("public_ip_check", False)
+
+    if not repo:
+        _die("No repo configured. Run 'stage setup' and set a repo URL first.")
+
+    url = _install_url(repo)
+    pub_flag = " --public-ip" if public_ip else ""
+    cmd = (
+        f"uv tool install {url} && "
+        f"stage setup --token {token} --port {port} --repo {repo}{pub_flag}"
+    )
+    console.print(
+        Panel(
+            cmd,
+            title="[bold cyan]Provision a new machine[/bold cyan]",
+            border_style="cyan",
+        )
+    )
+
+
+def _install_url(repo_url):
+    m = re.match(r"git@github\.com:([^/]+)/([^.]+?)(?:\.git)?$", repo_url)
+    if m:
+        return f"git+ssh://git@github.com/{m.group(1)}/{m.group(2)}"
+    return repo_url
+
+
+def _github_api_base(repo_url):
+    for pat in (
+        r"git@github\.com:([^/]+)/([^.]+?)(?:\.git)?$",
+        r"git\+ssh://git@github\.com/([^/]+)/([^.]+?)(?:\.git)?$",
+        r"https://github\.com/([^/]+)/([^.]+?)(?:\.git)?$",
+    ):
+        m = re.match(pat, repo_url)
+        if m:
+            return f"https://api.github.com/repos/{m.group(1)}/{m.group(2)}"
+    return None
+
+
+def _github_changelog(repo_url, old_sha, new_sha):
+    api_base = _github_api_base(repo_url)
+    if not api_base:
+        return None
+    try:
+        url = f"{api_base}/compare/{old_sha[:7]}...{new_sha[:7]}"
+        req = urllib_request.Request(
+            url,
+            headers={
+                "Accept": "application/vnd.github+json",
+                "User-Agent": "stage-cli",
+            },
+        )
+        resp = urllib_request.urlopen(req, timeout=5)
+        data = json.loads(resp.read())
+        commits = data.get("commits", [])
+        if not commits:
+            return None
+        lines = []
+        for c in reversed(commits):
+            msg = c["commit"]["message"].splitlines()[0]
+            sha = c["sha"][:7]
+            lines.append(f"[dim]{sha}[/dim] {msg}")
+        return "\n".join(lines)
+    except Exception:
+        return None
 
 
 def _maybe_check_updates():
@@ -564,9 +684,8 @@ def _maybe_check_updates():
             and state.get("installed_sha")
             and state["latest_sha"] != state["installed_sha"]
         ):
-            print(
-                "A new version of stage is available. Run 'stage update'.",
-                file=sys.stderr,
+            err_console.print(
+                "[yellow]A new version of stage is available. Run 'stage update'.[/yellow]"
             )
         if time.time() - state.get("last_checked", 0) > UPDATE_INTERVAL:
             subprocess.Popen(
@@ -587,7 +706,7 @@ def _do_update_check(repo):
     state["latest_sha"] = sha
     state["last_checked"] = time.time()
     if "installed_sha" not in state:
-        state["installed_sha"] = sha  # first check: baseline, no notice yet
+        state["installed_sha"] = sha
     _save_update_state(state)
 
 
@@ -628,30 +747,34 @@ def _base_url(host_str, default_port):
 
 
 def _download(resp, dest, name, suffix=None):
-    total = int(resp.headers.get("Content-Length", 0))
+    total = int(resp.headers.get("Content-Length", 0)) or None
     downloaded = 0
     start = time.monotonic()
-    tty = sys.stdout.isatty()
 
-    with open(dest, "wb") as f:
-        while chunk := resp.read(65536):
-            f.write(chunk)
-            downloaded += len(chunk)
-            if tty:
-                elapsed = max(time.monotonic() - start, 1e-9)
-                _render_bar(name, downloaded, total, downloaded / elapsed, end="")
+    with tqdm(
+        total=total,
+        unit="B",
+        unit_scale=True,
+        unit_divisor=1024,
+        desc=name,
+        ncols=80,
+        leave=False,
+        file=sys.stderr,
+    ) as bar:
+        with open(dest, "wb") as f:
+            while chunk := resp.read(65536):
+                f.write(chunk)
+                bar.update(len(chunk))
+                downloaded += len(chunk)
 
     elapsed = max(time.monotonic() - start, 1e-9)
     speed = downloaded / elapsed
     if suffix is None:
         suffix = f" -> {dest.name}" if dest.name != name else ""
-
-    if tty:
-        _render_bar(
-            name, downloaded, total or downloaded, speed, suffix=suffix, end="\n"
-        )
-    else:
-        print(f"{name}: {_human_size(downloaded)} at {_human_size(speed)}/s{suffix}")
+    console.print(
+        f"  {name}{suffix}  [cyan]{_human_size(downloaded)}[/cyan]"
+        f" at [cyan]{_human_size(speed)}/s[/cyan]"
+    )
 
 
 def _tar_filter(member, dest_path):
@@ -677,23 +800,6 @@ def _extract_archive(archive_path, target):
             target.mkdir(parents=True, exist_ok=True)
             for item in items:
                 shutil.move(str(item), str(target / item.name))
-
-
-def _render_bar(name, done, total, speed, suffix="", end=""):
-    BAR = 22
-    if total:
-        pct = min(done / total, 1.0)
-        filled = int(BAR * pct)
-        arrow = "" if filled >= BAR else ">"
-        bar = "=" * filled + arrow + " " * (BAR - filled - len(arrow))
-        line = (
-            f"\r{name}  [{bar}]  {pct:3.0%}"
-            f"  {_human_size(done)}/{_human_size(total)}"
-            f"  {_human_size(speed)}/s{suffix}"
-        )
-    else:
-        line = f"\r{name}  {_human_size(done)}  {_human_size(speed)}/s{suffix}"
-    print(line, end=end, flush=True)
 
 
 def _post(url, headers):
@@ -726,7 +832,7 @@ def _tailscale_peers():
             if not peer.get("Online", False):
                 continue
             for ip in peer.get("TailscaleIPs", []):
-                if ":" not in ip:  # IPv4 only
+                if ":" not in ip:
                     ips.append(ip)
                     break
         return ips
@@ -789,15 +895,26 @@ def _human_size(n):
 
 
 def _die(msg):
-    print(f"stage: {msg}", file=sys.stderr)
+    err_console.print(f"[red]stage: {msg}[/red]")
     sys.exit(1)
 
 
 def _usage():
-    print("Usage:")
-    print("  stage [-n N] <file> [files...]     Stage files (default: 1 pull allowed)")
-    print("  stage pull [<host>[:<port>]]       Pull staged files to current directory")
-    print("  stage status [<host>[:<port>]]     Show active staging session info")
-    print("  stage clear                        Cancel active staging session")
-    print("  stage update                       Upgrade to the latest version")
-    print("  stage setup                        Configure port, token, and repo")
+    console.print("Usage:")
+    console.print(
+        "  stage [-n N] <file> [files...]     Stage files (default: 1 pull allowed)"
+    )
+    console.print(
+        "  stage pull [<host>[:<port>]]       Pull staged files to current directory"
+    )
+    console.print(
+        "  stage status [<host>[:<port>]]     Show active staging session info"
+    )
+    console.print("  stage clear                        Cancel active staging session")
+    console.print("  stage update                       Upgrade to the latest version")
+    console.print(
+        "  stage provision                    Print one-liner to configure a new machine"
+    )
+    console.print(
+        "  stage setup                        Configure port, token, and repo"
+    )

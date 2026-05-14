@@ -3,7 +3,7 @@ name = "stage"
 version = "0.1.0"
 description = "Direct file transfer between machines via Tailscale or direct connection"
 requires-python = ">=3.14"
-dependencies = []
+dependencies = ["rich", "tqdm"]
 
 [project.scripts]
 stage = "stage:main"
