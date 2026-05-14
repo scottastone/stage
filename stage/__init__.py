@@ -614,13 +614,7 @@ def _provision():
         f"uv tool install {url} && "
         f"stage setup --token {token} --port {port} --repo {repo}{pub_flag}"
     )
-    console.print(
-        Panel(
-            cmd,
-            title="[bold cyan]Provision a new machine[/bold cyan]",
-            border_style="cyan",
-        )
-    )
+    print(cmd)
 
 
 def _install_url(repo_url):
