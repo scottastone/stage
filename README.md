@@ -8,7 +8,7 @@ You have a file on machine A. You want it on machine B. The standard options:
 
 - **scp / rsync**: You have to know the source path from the receiver's perspective, have SSH configured, and type out both sides of the connection. If you're the one receiving, you can't initiate -- you wait for the sender to push.
 - **croc / magic-wormhole**: Both sides have to be present at the same time to exchange a one-time code. You can't stage something and walk away.
-- **Tailscale Taildrop** (`tailscale file cp file.txt machine:`): Works well, but it's push-based. If you're on machine B and you know machine A has something for you, you cannot pull it. You have to go to machine A and push.
+- **Tailscale's Taildrop** (`tailscale file cp file.txt machine:`): Works well, but it's push-based. If you're on machine B and you know machine A has something for you, you cannot pull it. You have to go to machine A and push.
 
 `stage` inverts the model. The sender stages files once and walks away. The receiver pulls whenever they're ready, from wherever they are.
 
@@ -36,6 +36,13 @@ stage setup
 ```
 
 `setup` prompts for a port (default 47200), generates a shared token, and optionally configures update checks. Run the same command on each machine that will send or receive -- use `stage provision` to print a one-liner that configures a new machine with the same token.
+
+An example provision output might look like:
+
+```
+stage provision
+uv tool install git+ssh://git@github.com/scottastone/stage && stage setup --token <32 character bearer token> --port 47200 --repo git@github.com:scottastone/stage.git --public-ip
+```
 
 ## Usage
 
@@ -77,6 +84,8 @@ stage pull 192.168.1.42:8000        # direct IP with custom port
 
 Files are saved to the current directory. If a file already exists, it is renamed (e.g., `report_1.pdf`) rather than overwritten. Directories are streamed as tar and extracted in place.
 
+By default, only one pull is allowed per session, after which the session is automatically terminated and the files are no longer available. This can be overridden with the `-n <number>` flag to allow multiple pulls per session.
+
 ### Manage peers
 
 By default, `stage pull` probes all online Tailscale peers. You can also add peers by IP for machines not on Tailscale or on a different network:
@@ -110,7 +119,7 @@ By default, `stage` only accepts connections from private IP ranges:
 - Tailscale / CGNAT (100.64.0.0/10)
 - Loopback and link-local
 
-A connection from a public IP is rejected with 403 before authentication is even attempted. This means the token is never tested against requests from the internet unless you explicitly opt in with `--public`.
+A connection from a public IP is rejected with 403 before authentication is even attempted. This means the token is never tested against requests from the internet unless you explicitly opt in with `--public`. **If you decide to opt in, ensure you know what you are doing.**
 
 ### Token authentication
 
