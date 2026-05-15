@@ -177,7 +177,15 @@ class StageApp:
         MANIFEST_FILE.write_text(json.dumps({"files": files}, indent=2))
 
         proc = subprocess.Popen(
-            [sys.executable, "-m", "stage", "_serve", str(port), str(n), "1" if public else "0"],
+            [
+                sys.executable,
+                "-m",
+                "stage",
+                "_serve",
+                str(port),
+                str(n),
+                "1" if public else "0",
+            ],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             **_daemon_popen_kwargs(),
@@ -229,7 +237,9 @@ class StageApp:
             if ts_ip:
                 self.console.print("  Via Tailscale:  [bold]stage pull[/bold]")
             for ip in local_ips:
-                self.console.print(f"  Direct:         [bold]stage pull {ip}:{port}[/bold]")
+                self.console.print(
+                    f"  Direct:         [bold]stage pull {ip}:{port}[/bold]"
+                )
             if pub_ip[0]:
                 if public:
                     self.console.print(
@@ -241,7 +251,9 @@ class StageApp:
                         f" (add --public to accept)[/dim]"
                     )
             if not ts_ip and not local_ips and not pub_ip[0]:
-                self.console.print(f"  [bold]stage pull <this-machine-ip>:{port}[/bold]")
+                self.console.print(
+                    f"  [bold]stage pull <this-machine-ip>:{port}[/bold]"
+                )
 
         except KeyboardInterrupt:
             try:
@@ -299,11 +311,17 @@ class StageApp:
                     return
                 path = unquote(self.path.lstrip("/"))
                 if path in ("manifest", "status"):
+
                     def _entry_meta(e):
-                        m = {"name": e["name"], "type": e.get("type", "file"), "size": e["size"]}
+                        m = {
+                            "name": e["name"],
+                            "type": e.get("type", "file"),
+                            "size": e["size"],
+                        }
                         if "file_count" in e:
                             m["file_count"] = e["file_count"]
                         return m
+
                     body = json.dumps(
                         {
                             "files": [_entry_meta(e) for e in entries.values()],
@@ -529,6 +547,7 @@ class StageApp:
                         file=sys.stderr,
                         disable=not show_progress,
                     ) as bar:
+
                         class _Reader:
                             def read(self, n=-1):
                                 chunk = resp.read(n)
@@ -566,7 +585,9 @@ class StageApp:
 
         n_workers = min(4, len(assignments))
         executor = ThreadPoolExecutor(max_workers=n_workers)
-        futures = {executor.submit(fetch, entry, dest): entry for entry, dest in assignments}
+        futures = {
+            executor.submit(fetch, entry, dest): entry for entry, dest in assignments
+        }
         try:
             for fut in as_completed(futures):
                 err = fut.result()
@@ -978,15 +999,17 @@ def _tar_filter(member, dest_path):
     return result
 
 
-
 def _proc_alive(pid: int) -> bool:
     """Check whether a process is running without sending it a signal."""
     if sys.platform == "win32":
         import ctypes
         import ctypes.wintypes
+
         PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
         STILL_ACTIVE = 259
-        h = ctypes.windll.kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+        h = ctypes.windll.kernel32.OpenProcess(
+            PROCESS_QUERY_LIMITED_INFORMATION, False, pid
+        )
         if not h:
             return False
         try:
@@ -1007,6 +1030,7 @@ def _proc_terminate(pid: int) -> None:
     """Terminate a process by PID, cross-platform."""
     if sys.platform == "win32":
         import ctypes
+
         PROCESS_TERMINATE = 0x0001
         h = ctypes.windll.kernel32.OpenProcess(PROCESS_TERMINATE, False, pid)
         if h:
