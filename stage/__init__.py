@@ -1,3 +1,4 @@
+import gzip
 import ipaddress
 import json
 import os
@@ -31,6 +32,7 @@ CONFIG_PATH = Path.home() / ".config" / "stage" / "config.toml"
 PID_FILE = STAGE_DIR / "daemon.pid"
 MANIFEST_FILE = STAGE_DIR / "manifest.json"
 UPDATE_FILE = STAGE_DIR / "update.json"
+PEERS_FILE = STAGE_DIR / "peers.json"
 DEFAULT_PORT = 47200
 PROBE_TIMEOUT = 3
 UPDATE_INTERVAL = 86400
@@ -95,6 +97,8 @@ class StageApp:
             self.pull(args[1] if len(args) > 1 else None)
         elif cmd == "status":
             self.status(args[1] if len(args) > 1 else None)
+        elif cmd == "peers":
+            self.peers(args[1:])
         elif cmd == "clear":
             self.clear()
         elif cmd == "update":
@@ -106,6 +110,8 @@ class StageApp:
         else:
             n = 1
             public = False
+            compress = False
+            quiet = False
             paths = []
             i = 0
             while i < len(args):
@@ -120,19 +126,25 @@ class StageApp:
                 elif args[i] == "--public":
                     public = True
                     i += 1
+                elif args[i] in ("-z", "--compress"):
+                    compress = True
+                    i += 1
+                elif args[i] in ("-q", "--quiet"):
+                    quiet = True
+                    i += 1
                 else:
                     paths.append(args[i])
                     i += 1
             if not paths:
                 self._usage()
                 return
-            self.stage(paths, n, public=public)
+            self.stage(paths, n, public=public, compress=compress, quiet=quiet)
 
     # -------------------------------------------------------------------------
     # Staging
     # -------------------------------------------------------------------------
 
-    def stage(self, paths, n=1, public=False):
+    def stage(self, paths, n=1, public=False, compress=False, quiet=False):
         files = []
         for p in paths:
             path = Path(p).resolve()
@@ -143,10 +155,11 @@ class StageApp:
                     f"Sizing [bold]{path.name}/[/bold]...", console=self.console
                 ):
                     size, file_count = _dir_stats(path)
-                self.console.print(
-                    f"Staged [bold]{path.name}/[/bold]"
-                    f" ([cyan]{_human_size(size)}[/cyan], {file_count} files)"
-                )
+                if not quiet:
+                    self.console.print(
+                        f"Staged [bold]{path.name}/[/bold]"
+                        f" ([cyan]{_human_size(size)}[/cyan], {file_count} files)"
+                    )
                 files.append(
                     {
                         "name": path.name,
@@ -168,13 +181,38 @@ class StageApp:
             else:
                 self.die(f"Not a file or directory: {p}")
 
+        # If a session is already running, amend it rather than error out.
         if _is_daemon_running():
-            self.die("A staging session is already active. Run 'stage clear' first.")
+            port = int(self.config["stage"].get("port", DEFAULT_PORT))
+            token = self.config["stage"]["token"]
+            amend_headers = {
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json",
+            }
+            body = json.dumps({"files": files}).encode()
+            req = urllib_request.Request(
+                f"http://127.0.0.1:{port}/amend",
+                headers=amend_headers,
+                data=body,
+                method="POST",
+            )
+            try:
+                urllib_request.urlopen(req, timeout=10)
+            except Exception as e:
+                self.die(f"Failed to amend active session: {e}")
+            if not quiet:
+                for f in files:
+                    indicator = "/" if f.get("type") == "dir" else ""
+                    self.console.print(
+                        f"Amended: [bold]{f['name']}{indicator}[/bold]"
+                        f"  [cyan]{_human_size(f['size'])}[/cyan]"
+                    )
+            return
 
         port = int(self.config["stage"].get("port", DEFAULT_PORT))
 
         STAGE_DIR.mkdir(parents=True, exist_ok=True)
-        MANIFEST_FILE.write_text(json.dumps({"files": files}, indent=2))
+        MANIFEST_FILE.write_text(json.dumps({"files": files, "compress": compress}, indent=2))
 
         proc = subprocess.Popen(
             [
@@ -216,44 +254,47 @@ class StageApp:
                 t.start()
                 t.join(timeout=4)
 
-            total = sum(f["size"] for f in files)
-            names = ", ".join(
-                f["name"] + ("/" if f.get("type") == "dir" else "") for f in files
-            )
-            pull_s = "pull" if n == 1 else "pulls"
-            self.console.print(
-                f"\nStaged: [bold]{names}[/bold] ([cyan]{_human_size(total)}[/cyan], {n} {pull_s} allowed)\n"
-            )
-
-            if public:
+            if not quiet:
+                total = sum(f["size"] for f in files)
+                names = ", ".join(
+                    f["name"] + ("/" if f.get("type") == "dir" else "") for f in files
+                )
+                pull_s = "pull" if n == 1 else "pulls"
+                compress_note = " [dim](compressed)[/dim]" if compress else ""
                 self.console.print(
-                    "[yellow]Warning: --public is set. Connections from any IP address"
-                    " will be accepted. Only use this on networks you trust.[/yellow]\n"
+                    f"\nStaged: [bold]{names}[/bold]"
+                    f" ([cyan]{_human_size(total)}[/cyan], {n} {pull_s} allowed){compress_note}\n"
                 )
 
-            ts_ip, _peers = _tailscale_info()
-            local_ips = [ip for ip in _local_ips() if ip != ts_ip]
-
-            if ts_ip:
-                self.console.print("  Via Tailscale:  [bold]stage pull[/bold]")
-            for ip in local_ips:
-                self.console.print(
-                    f"  Direct:         [bold]stage pull {ip}:{port}[/bold]"
-                )
-            if pub_ip[0]:
                 if public:
                     self.console.print(
-                        f"  Public IP:      [bold]stage pull {pub_ip[0]}:{port}[/bold]"
+                        "[yellow]Warning: --public is set. Connections from any IP address"
+                        " will be accepted. Only use this on networks you trust.[/yellow]\n"
                     )
-                else:
+
+                ts_ip, ts_peers = _tailscale_info()
+                local_ips = [ip for ip in _local_ips() if ip != ts_ip]
+
+                if ts_ip:
+                    self.console.print("  Via Tailscale:  [bold]stage pull[/bold]")
+                for ip in local_ips:
                     self.console.print(
-                        f"  Public IP:      [dim]{pub_ip[0]}:{port}"
-                        f" (add --public to accept)[/dim]"
+                        f"  Direct:         [bold]stage pull {ip}:{port}[/bold]"
                     )
-            if not ts_ip and not local_ips and not pub_ip[0]:
-                self.console.print(
-                    f"  [bold]stage pull <this-machine-ip>:{port}[/bold]"
-                )
+                if pub_ip[0]:
+                    if public:
+                        self.console.print(
+                            f"  Public IP:      [bold]stage pull {pub_ip[0]}:{port}[/bold]"
+                        )
+                    else:
+                        self.console.print(
+                            f"  Public IP:      [dim]{pub_ip[0]}:{port}"
+                            f" (add --public to accept)[/dim]"
+                        )
+                if not ts_ip and not local_ips and not pub_ip[0]:
+                    self.console.print(
+                        f"  [bold]stage pull <this-machine-ip>:{port}[/bold]"
+                    )
 
         except KeyboardInterrupt:
             try:
@@ -272,7 +313,9 @@ class StageApp:
     def _run_daemon(self, port, n, public=False):
         token = self.config["stage"]["token"]
         manifest = json.loads(MANIFEST_FILE.read_text())
+        compress = manifest.get("compress", False)
         entries = {f["name"]: f for f in manifest["files"]}
+        entries_lock = threading.Lock()
         pulls_remaining = [n]
         done_event = threading.Event()
 
@@ -322,54 +365,64 @@ class StageApp:
                             m["file_count"] = e["file_count"]
                         return m
 
+                    with entries_lock:
+                        file_list = [_entry_meta(e) for e in entries.values()]
                     body = json.dumps(
                         {
-                            "files": [_entry_meta(e) for e in entries.values()],
+                            "files": file_list,
                             "pulls_remaining": pulls_remaining[0],
+                            "compress": compress,
                         }
                     ).encode()
                     self._respond(200, "application/json", body)
                 elif path.startswith("files/"):
                     name = path[6:]
-                    if name not in entries:
+                    with entries_lock:
+                        entry = entries.get(name)
+                    if entry is None:
                         self.send_error(404)
                         return
-                    entry = entries[name]
                     fp = Path(entry["path"])
                     if not fp.exists():
                         self.send_error(410)
                         return
                     if entry.get("type") == "dir":
-                        # Stream directory as uncompressed tar on demand. Gzip saves
-                        # bandwidth but costs more CPU than it saves on fast LAN/Tailscale
-                        # links, especially for directories with many small files.
-                        # Connection: close is required because we don't know Content-Length.
+                        # Connection: close is required because Content-Length is unknown.
+                        # compress=True uses gzip; default is uncompressed (fast LAN/VPN).
+                        tar_mode = "w|gz" if compress else "w|"
                         self.send_response(200)
                         self.send_header("Content-Type", "application/x-tar")
                         self.send_header("Connection", "close")
                         self.close_connection = True
                         self.end_headers()
                         try:
-                            with tarfile.open(fileobj=self.wfile, mode="w|") as tar:
+                            with tarfile.open(fileobj=self.wfile, mode=tar_mode) as tar:
                                 tar.add(fp, arcname=fp.name)
                         except OSError:
                             # Covers client disconnect (BrokenPipeError,
-                            # ConnectionResetError) on both POSIX and Windows
-                            # (where socket errors surface as plain OSError).
+                            # ConnectionResetError) on both POSIX and Windows.
                             pass
                     else:
                         self.send_response(200)
                         self.send_header("Content-Type", "application/octet-stream")
-                        self.send_header("Content-Length", str(fp.stat().st_size))
+                        if compress:
+                            self.send_header("Connection", "close")
+                            self.close_connection = True
+                        else:
+                            self.send_header("Content-Length", str(fp.stat().st_size))
                         self.end_headers()
                         try:
-                            with open(fp, "rb") as f:
-                                while chunk := f.read(65536):
-                                    self.wfile.write(chunk)
+                            if compress:
+                                with open(fp, "rb") as f:
+                                    with gzip.GzipFile(fileobj=self.wfile, mode="wb") as gz:
+                                        while chunk := f.read(65536):
+                                            gz.write(chunk)
+                            else:
+                                with open(fp, "rb") as f:
+                                    while chunk := f.read(65536):
+                                        self.wfile.write(chunk)
                         except OSError:
-                            # Same as above; also covers FileNotFoundError if
-                            # the file disappears between the exists() check
-                            # and the open() call (TOCTOU).
+                            # Same as above; also covers TOCTOU FileNotFoundError.
                             pass
                 else:
                     self.send_error(404)
@@ -392,6 +445,21 @@ class StageApp:
                 elif self.path == "/cancel":
                     self._respond(200, "text/plain", b"cancelled")
                     done_event.set()
+                elif self.path == "/amend":
+                    length = int(self.headers.get("Content-Length", 0))
+                    new_files = json.loads(self.rfile.read(length)).get("files", [])
+                    with entries_lock:
+                        for f in new_files:
+                            entries[f["name"]] = f
+                        all_files = list(entries.values())
+                    MANIFEST_FILE.write_text(
+                        json.dumps({"files": all_files, "compress": compress}, indent=2)
+                    )
+                    self._respond(
+                        200,
+                        "application/json",
+                        json.dumps({"files": list(entries.keys())}).encode(),
+                    )
                 else:
                     self.send_error(404)
 
@@ -423,7 +491,7 @@ class StageApp:
     # -------------------------------------------------------------------------
 
     def _find_session(self, host_arg, *, quiet=False):
-        """Return (base_url, headers, manifest_data) or None."""
+        """Return (base_url, headers, manifest_data, source_label) or None."""
         token = self.config["stage"]["token"]
         port = int(self.config["stage"].get("port", DEFAULT_PORT))
         headers = {"Authorization": f"Bearer {token}"}
@@ -433,17 +501,21 @@ class StageApp:
             try:
                 req = urllib_request.Request(f"{base}/manifest", headers=headers)
                 resp = urllib_request.urlopen(req, timeout=PROBE_TIMEOUT)
-                return base, headers, json.loads(resp.read())
+                return base, headers, json.loads(resp.read()), host_arg
             except Exception:
                 if not quiet:
                     self.die(f"No active session reachable at {host_arg}")
                 return None
 
-        _local_ip, peers = _tailscale_info()
-        if not peers:
+        _local_ip, ts_peers = _tailscale_info()
+        hostname_map = {ip: hostname for ip, hostname in ts_peers}
+        extra_ips = _load_peers()
+        all_peers = [ip for ip, _ in ts_peers] + extra_ips
+
+        if not all_peers:
             if not quiet:
                 self.die(
-                    "No Tailscale peers found.\n"
+                    "No Tailscale peers found and no extra peers configured.\n"
                     "For a direct connection: stage pull <host>[:<port>]"
                 )
             return None
@@ -462,13 +534,15 @@ class StageApp:
                 data = json.loads(resp.read())
                 with lock:
                     if result[0] is None:
-                        result[0] = (base, headers, data)
+                        hostname = hostname_map.get(ip, "")
+                        label = f"{hostname} ({ip})" if hostname else ip
+                        result[0] = (base, headers, data, label)
                         found.set()
             except Exception:
                 pass
 
         threads = [
-            threading.Thread(target=probe, args=(ip,), daemon=True) for ip in peers
+            threading.Thread(target=probe, args=(ip,), daemon=True) for ip in all_peers
         ]
         for t in threads:
             t.start()
@@ -477,7 +551,7 @@ class StageApp:
         if result[0] is None:
             if not quiet:
                 self.die(
-                    "No active staging session found on any Tailscale peer.\n"
+                    "No active staging session found on any reachable peer.\n"
                     "For a direct connection: stage pull <host>[:<port>]"
                 )
             return None
@@ -491,9 +565,10 @@ class StageApp:
         session = self._find_session(host_arg)
         if session is None:
             return
-        base, headers, data = session
+        base, headers, data, source_label = session
 
         raw = data["files"]
+        compress = data.get("compress", False)
         file_entries = [
             f if isinstance(f, dict) else {"name": f, "type": "file"} for f in raw
         ]
@@ -502,7 +577,7 @@ class StageApp:
             _post(f"{base}/done", headers)
             return
 
-        from_host = base.removeprefix("http://")
+        from_label = source_label or base.removeprefix("http://")
         table = Table(show_header=False, box=None, padding=(0, 2))
         table.add_column()
         table.add_column(justify="right", style="cyan")
@@ -510,7 +585,7 @@ class StageApp:
             indicator = "/" if entry.get("type") == "dir" else ""
             size_str = _human_size(entry["size"]) if "size" in entry else ""
             table.add_row(f"{entry['name']}{indicator}", size_str)
-        self.console.print(f"From [bold]{from_host}[/bold]:")
+        self.console.print(f"From [bold]{from_label}[/bold]:")
         self.console.print(table)
 
         cwd = Path.cwd()
@@ -533,7 +608,9 @@ class StageApp:
                 req = urllib_request.Request(f"{base}/files/{encoded}", headers=headers)
                 resp = urllib_request.urlopen(req, timeout=300)
                 if entry_type == "dir":
-                    total_bytes = entry.get("size") or None
+                    # When compressed, we don't know the compressed size ahead of time,
+                    # so suppress the total to avoid a misleading progress bar.
+                    total_bytes = None if compress else (entry.get("size") or None)
                     total_files = entry.get("file_count")
                     files_done = 0
                     with tqdm(
@@ -555,8 +632,9 @@ class StageApp:
                                     bar.update(len(chunk))
                                 return chunk
 
+                        tar_mode = "r|gz" if compress else "r|"
                         with tempfile.TemporaryDirectory() as tmp_dir:
-                            with tarfile.open(fileobj=_Reader(), mode="r|") as tar:
+                            with tarfile.open(fileobj=_Reader(), mode=tar_mode) as tar:
                                 for member in tar:
                                     tar.extract(member, tmp_dir, filter=_tar_filter)
                                     if member.isfile():
@@ -578,7 +656,8 @@ class StageApp:
                     with self._print_lock:
                         self.console.print(f"  extracted [bold]{name}/[/bold]{rename}")
                 else:
-                    self._download(resp, dest, name, show_progress=show_progress)
+                    file_resp = gzip.GzipFile(fileobj=resp, mode="rb") if compress else resp
+                    self._download(file_resp, dest, name, show_progress=show_progress)
                 return None
             except (URLError, OSError, tarfile.TarError) as e:
                 return (name, e)
@@ -628,7 +707,8 @@ class StageApp:
             sys.exit(1)
 
     def _download(self, resp, dest, name, suffix=None, show_progress=True):
-        total = int(resp.headers.get("Content-Length", 0)) or None
+        hdrs = getattr(resp, "headers", None)
+        total = (int(hdrs.get("Content-Length", 0)) or None) if hdrs else None
         downloaded = 0
         start = time.monotonic()
 
@@ -668,11 +748,12 @@ class StageApp:
         if session is None:
             self.console.print("No active staging session found.")
             return
-        _, _, data = session
+        _, _, data, source_label = session
         pulls = data.get("pulls_remaining", "?")
         entries = data["files"]
+        from_str = f" from [bold]{source_label}[/bold]" if source_label else ""
         self.console.print(
-            f"[bold]Active:[/bold] {len(entries)} item(s), {pulls} pull(s) remaining"
+            f"[bold]Active:[/bold] {len(entries)} item(s), {pulls} pull(s) remaining{from_str}"
         )
         table = Table(show_header=False, box=None, padding=(0, 2))
         table.add_column()
@@ -697,6 +778,72 @@ class StageApp:
         PID_FILE.unlink(missing_ok=True)
         MANIFEST_FILE.unlink(missing_ok=True)
         self.console.print("Staging session cleared.")
+
+    # -------------------------------------------------------------------------
+    # Peers
+    # -------------------------------------------------------------------------
+
+    def peers(self, args=None):
+        args = list(args or [])
+        if not args or args[0] == "list":
+            self._peers_list()
+        elif args[0] == "add" and len(args) > 1:
+            self._peers_add(args[1])
+        elif args[0] == "remove" and len(args) > 1:
+            self._peers_remove(args[1])
+        else:
+            self.console.print(
+                "Usage: stage peers [add <ip> | remove <ip>]"
+            )
+
+    def _peers_list(self):
+        _, ts_peers = _tailscale_info()
+        extra = _load_peers()
+
+        if ts_peers:
+            table = Table(show_header=True, box=None, padding=(0, 2))
+            table.add_column("Hostname", style="bold")
+            table.add_column("IP")
+            for ip, hostname in ts_peers:
+                table.add_row(hostname or "[dim]unknown[/dim]", ip)
+            self.console.print("Tailscale peers:")
+            self.console.print(table)
+        else:
+            self.console.print("[dim]No Tailscale peers found.[/dim]")
+
+        if extra:
+            self.console.print("\nConfigured extra peers:")
+            for ip in extra:
+                tag = " [yellow](public)[/yellow]" if not _is_private_ip(ip) else ""
+                self.console.print(f"  {ip}{tag}")
+        elif not ts_peers:
+            self.console.print(
+                "\nNo extra peers configured. Use 'stage peers add <ip>' to add one."
+            )
+
+    def _peers_add(self, ip: str):
+        existing = _load_peers()
+        if ip in existing:
+            self.console.print(f"{ip} is already in the peer list.")
+            return
+        if not _is_private_ip(ip):
+            self.console.print(
+                f"[yellow]Warning: {ip} appears to be a public IP address.[/yellow]\n"
+                "Connections to this peer will bypass private-network restrictions.\n"
+                "Make sure you trust this host and its network."
+            )
+        existing.append(ip)
+        _save_peers(existing)
+        self.console.print(f"Added {ip} to peer list.")
+
+    def _peers_remove(self, ip: str):
+        existing = _load_peers()
+        if ip not in existing:
+            self.console.print(f"{ip} is not in the peer list.")
+            return
+        existing.remove(ip)
+        _save_peers(existing)
+        self.console.print(f"Removed {ip} from peer list.")
 
     # -------------------------------------------------------------------------
     # Setup / Update / Provision
@@ -906,14 +1053,33 @@ class StageApp:
     def _usage(self):
         self.console.print("Usage:")
         self.console.print(
-            "  stage [-n N] [--public] <file> [files...]"
-            "  Stage files (default: 1 pull, private IPs only)"
+            "  stage [-n N] [-z] [-q] [--public] <file> [files...]"
         )
+        self.console.print(
+            "      Stage files. Appends to an active session if one exists."
+        )
+        self.console.print(
+            "      -n N       Allow N pulls (default 1)"
+        )
+        self.console.print(
+            "      -z         Compress transfer with gzip (slower CPU, less bandwidth)"
+        )
+        self.console.print(
+            "      -q         Quiet: suppress output unless there is an error"
+        )
+        self.console.print(
+            "      --public   Accept connections from any IP (default: private/Tailscale only)"
+        )
+        self.console.print("")
         self.console.print(
             "  stage pull [<host>[:<port>]]       Pull staged files to current directory"
         )
         self.console.print(
-            "  stage status [<host>[:<port>]]     Show active staging session info"
+            "  stage status [<host>[:<port>]]     Show what is staged and where"
+        )
+        self.console.print(
+            "  stage peers [add|remove <ip>]      List or manage discoverable peers",
+            markup=False,
         )
         self.console.print(
             "  stage clear                        Cancel active staging session"
@@ -945,7 +1111,7 @@ def _dir_stats(path: Path) -> tuple[int, int]:
 
 
 def _tailscale_info():
-    """Return (local_ipv4, peer_ipv4s) from a single tailscale status --json call."""
+    """Return (local_ipv4, peers) where peers is a list of (ipv4, hostname) tuples."""
     try:
         r = subprocess.run(
             ["tailscale", "status", "--json"], capture_output=True, text=True, timeout=5
@@ -962,13 +1128,28 @@ def _tailscale_info():
         for peer in data.get("Peer", {}).values():
             if not peer.get("Online", False):
                 continue
+            hostname = peer.get("HostName", "")
             for ip in peer.get("TailscaleIPs", []):
                 if ":" not in ip:
-                    peers.append(ip)
+                    peers.append((ip, hostname))
                     break
         return local_ip, peers
     except (FileNotFoundError, subprocess.TimeoutExpired, json.JSONDecodeError):
         return None, []
+
+
+def _load_peers() -> list[str]:
+    try:
+        if PEERS_FILE.exists():
+            return json.loads(PEERS_FILE.read_text())
+    except Exception:
+        pass
+    return []
+
+
+def _save_peers(peers: list[str]) -> None:
+    STAGE_DIR.mkdir(parents=True, exist_ok=True)
+    PEERS_FILE.write_text(json.dumps(peers))
 
 
 # Windows reserved device names that cannot be used as filenames.
