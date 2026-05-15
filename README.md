@@ -45,6 +45,8 @@ stage setup
 stage report.pdf
 stage ~/Downloads/archive.zip ~/Documents/notes/
 stage -n 3 dataset.tar          # allow up to 3 pulls
+stage -z large-dir/             # compress transfer (less bandwidth, more CPU)
+stage -q build-output/          # quiet: no output unless an error occurs
 stage --public large-file.iso   # accept connections from any IP (see Security)
 ```
 
@@ -58,6 +60,13 @@ Staged: report.pdf (2.3 MB, 1 pull allowed)
   Public IP:      203.0.113.5:47200 (add --public to accept)
 ```
 
+If a session is already running, staging additional files amends it rather than erroring:
+
+```
+stage report.pdf               # starts a session
+stage notes.txt                # adds notes.txt to the same session
+```
+
 ### Pull files
 
 ```
@@ -66,12 +75,25 @@ stage pull 192.168.1.42             # direct IP
 stage pull 192.168.1.42:8000        # direct IP with custom port
 ```
 
-Files are saved to the current directory. If a file already exists, it is renamed (e.g., `report_1.pdf`) rather than overwritten. Directories are streamed as uncompressed tar and extracted in place.
+Files are saved to the current directory. If a file already exists, it is renamed (e.g., `report_1.pdf`) rather than overwritten. Directories are streamed as tar and extracted in place.
+
+### Manage peers
+
+By default, `stage pull` probes all online Tailscale peers. You can also add peers by IP for machines not on Tailscale or on a different network:
+
+```
+stage peers                     # list Tailscale peers and any configured extras
+stage peers add 192.168.1.50    # add a peer by IP
+stage peers add 203.0.113.5     # add a public IP (shows a warning)
+stage peers remove 192.168.1.50 # remove a peer
+```
+
+Extra peers are stored in `~/.stage/peers.json` and probed alongside Tailscale peers on every `stage pull`.
 
 ### Other commands
 
 ```
-stage status                        # show what's currently staged and pulls remaining
+stage status                        # show what's staged, pulls remaining, and source host
 stage status 192.168.1.42           # check a specific host
 stage clear                         # cancel the active staging session
 stage update                        # upgrade to the latest version
@@ -120,7 +142,7 @@ This prints a warning and enables connections from any source IP. Only use this 
 
 ### Archive extraction safety
 
-Directories are transferred as tar streams. Extraction uses `tarfile.data_filter` (Python 3.12+), which blocks path traversal attacks (e.g., `../../etc/passwd`). Absolute symlinks and symlinks pointing outside the destination are silently skipped. On Windows, entries matching reserved device names (CON, NUL, COM1-COM9, LPT1-LPT9) are also skipped.
+Directories are transferred as tar streams (uncompressed by default, gzip with `-z`). Extraction uses `tarfile.data_filter` (Python 3.12+), which blocks path traversal attacks (e.g., `../../etc/passwd`). Absolute symlinks and symlinks pointing outside the destination are silently skipped. On Windows, entries matching reserved device names (CON, NUL, COM1-COM9, LPT1-LPT9) are also skipped.
 
 ## Compared to alternatives
 
