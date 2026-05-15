@@ -1,3 +1,4 @@
+import ipaddress
 import json
 import os
 import re
@@ -34,6 +35,22 @@ DEFAULT_PORT = 47200
 PROBE_TIMEOUT = 3
 UPDATE_INTERVAL = 86400
 
+# Networks considered "private" for the purpose of default access control.
+# Connections from outside these ranges are rejected unless --public is given.
+# Covers: loopback, RFC 1918, CGNAT/Tailscale (100.64.0.0/10, RFC 6598),
+# link-local, and IPv6 equivalents.
+_PRIVATE_NETS = [
+    ipaddress.ip_network("127.0.0.0/8"),
+    ipaddress.ip_network("10.0.0.0/8"),
+    ipaddress.ip_network("172.16.0.0/12"),
+    ipaddress.ip_network("192.168.0.0/16"),
+    ipaddress.ip_network("100.64.0.0/10"),
+    ipaddress.ip_network("169.254.0.0/16"),
+    ipaddress.ip_network("::1/128"),
+    ipaddress.ip_network("fc00::/7"),
+    ipaddress.ip_network("fe80::/10"),
+]
+
 
 class StageApp:
     def __init__(self):
@@ -64,7 +81,8 @@ class StageApp:
         cmd = args[0]
 
         if cmd == "_serve":
-            self._run_daemon(int(args[1]), int(args[2]))
+            public = len(args) > 3 and args[3] == "1"
+            self._run_daemon(int(args[1]), int(args[2]), public=public)
             return
         if cmd == "_check":
             if len(args) > 1:
@@ -87,6 +105,7 @@ class StageApp:
             self.provision()
         else:
             n = 1
+            public = False
             paths = []
             i = 0
             while i < len(args):
@@ -98,19 +117,22 @@ class StageApp:
                     except ValueError:
                         self.die(f"Invalid value for -n: {args[i + 1]}")
                     i += 2
+                elif args[i] == "--public":
+                    public = True
+                    i += 1
                 else:
                     paths.append(args[i])
                     i += 1
             if not paths:
                 self._usage()
                 return
-            self.stage(paths, n)
+            self.stage(paths, n, public=public)
 
     # -------------------------------------------------------------------------
     # Staging
     # -------------------------------------------------------------------------
 
-    def stage(self, paths, n=1):
+    def stage(self, paths, n=1, public=False):
         files = []
         for p in paths:
             path = Path(p).resolve()
@@ -155,10 +177,10 @@ class StageApp:
         MANIFEST_FILE.write_text(json.dumps({"files": files}, indent=2))
 
         proc = subprocess.Popen(
-            [sys.executable, "-m", "stage", "_serve", str(port), str(n)],
-            start_new_session=True,
+            [sys.executable, "-m", "stage", "_serve", str(port), str(n), "1" if public else "0"],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
+            **_daemon_popen_kwargs(),
         )
         PID_FILE.write_text(str(proc.pid))
 
@@ -195,6 +217,12 @@ class StageApp:
                 f"\nStaged: [bold]{names}[/bold] ([cyan]{_human_size(total)}[/cyan], {n} {pull_s} allowed)\n"
             )
 
+            if public:
+                self.console.print(
+                    "[yellow]Warning: --public is set. Connections from any IP address"
+                    " will be accepted. Only use this on networks you trust.[/yellow]\n"
+                )
+
             ts_ip, _peers = _tailscale_info()
             local_ips = [ip for ip in _local_ips() if ip != ts_ip]
 
@@ -203,9 +231,15 @@ class StageApp:
             for ip in local_ips:
                 self.console.print(f"  Direct:         [bold]stage pull {ip}:{port}[/bold]")
             if pub_ip[0]:
-                self.console.print(
-                    f"  Public IP:      [bold]stage pull {pub_ip[0]}:{port}[/bold]"
-                )
+                if public:
+                    self.console.print(
+                        f"  Public IP:      [bold]stage pull {pub_ip[0]}:{port}[/bold]"
+                    )
+                else:
+                    self.console.print(
+                        f"  Public IP:      [dim]{pub_ip[0]}:{port}"
+                        f" (add --public to accept)[/dim]"
+                    )
             if not ts_ip and not local_ips and not pub_ip[0]:
                 self.console.print(f"  [bold]stage pull <this-machine-ip>:{port}[/bold]")
 
@@ -223,7 +257,7 @@ class StageApp:
     # Daemon
     # -------------------------------------------------------------------------
 
-    def _run_daemon(self, port, n):
+    def _run_daemon(self, port, n, public=False):
         token = self.config["stage"]["token"]
         manifest = json.loads(MANIFEST_FILE.read_text())
         entries = {f["name"]: f for f in manifest["files"]}
@@ -234,14 +268,32 @@ class StageApp:
             done_event.set()
 
         signal.signal(signal.SIGTERM, _shutdown)
+        # SIGBREAK is the closest Windows equivalent to SIGTERM for interactive shutdown.
+        if hasattr(signal, "SIGBREAK"):
+            signal.signal(signal.SIGBREAK, _shutdown)
 
         class Handler(BaseHTTPRequestHandler):
             def log_message(self, *args):
                 pass
 
+            def _allowed_client(self):
+                if public:
+                    return True
+                if _is_private_ip(self.client_address[0]):
+                    return True
+                self.send_error(403)
+                return False
+
             def do_GET(self):
                 if self.path == "/health":
-                    self._respond(200, "text/plain", b"ok")
+                    # Only respond to localhost; external probing reveals the
+                    # daemon is running without any authentication.
+                    if self.client_address[0] == "127.0.0.1":
+                        self._respond(200, "text/plain", b"ok")
+                    else:
+                        self.send_error(404)
+                    return
+                if not self._allowed_client():
                     return
                 if not self._auth():
                     return
@@ -282,7 +334,10 @@ class StageApp:
                         try:
                             with tarfile.open(fileobj=self.wfile, mode="w|") as tar:
                                 tar.add(fp, arcname=fp.name)
-                        except (BrokenPipeError, ConnectionResetError):
+                        except OSError:
+                            # Covers client disconnect (BrokenPipeError,
+                            # ConnectionResetError) on both POSIX and Windows
+                            # (where socket errors surface as plain OSError).
                             pass
                     else:
                         self.send_response(200)
@@ -293,12 +348,17 @@ class StageApp:
                             with open(fp, "rb") as f:
                                 while chunk := f.read(65536):
                                     self.wfile.write(chunk)
-                        except (BrokenPipeError, ConnectionResetError):
+                        except OSError:
+                            # Same as above; also covers FileNotFoundError if
+                            # the file disappears between the exists() check
+                            # and the open() call (TOCTOU).
                             pass
                 else:
                     self.send_error(404)
 
             def do_POST(self):
+                if not self._allowed_client():
+                    return
                 if not self._auth():
                     return
                 if self.path == "/done":
@@ -610,8 +670,8 @@ class StageApp:
             return
         pid = int(PID_FILE.read_text().strip())
         try:
-            os.kill(pid, signal.SIGTERM)
-        except ProcessLookupError:
+            _proc_terminate(pid)
+        except OSError:
             pass
         PID_FILE.unlink(missing_ok=True)
         MANIFEST_FILE.unlink(missing_ok=True)
@@ -800,9 +860,9 @@ class StageApp:
             if time.time() - state.get("last_checked", 0) > UPDATE_INTERVAL:
                 subprocess.Popen(
                     [sys.executable, "-m", "stage", "_check", repo],
-                    start_new_session=True,
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL,
+                    **_daemon_popen_kwargs(),
                 )
         except Exception:
             pass
@@ -825,7 +885,8 @@ class StageApp:
     def _usage(self):
         self.console.print("Usage:")
         self.console.print(
-            "  stage [-n N] <file> [files...]     Stage files (default: 1 pull allowed)"
+            "  stage [-n N] [--public] <file> [files...]"
+            "  Stage files (default: 1 pull, private IPs only)"
         )
         self.console.print(
             "  stage pull [<host>[:<port>]]       Pull staged files to current directory"
@@ -889,16 +950,93 @@ def _tailscale_info():
         return None, []
 
 
+# Windows reserved device names that cannot be used as filenames.
+_WIN_RESERVED = re.compile(
+    r"^(CON|PRN|AUX|NUL|COM[0-9]|LPT[0-9])(\..*)?$", re.IGNORECASE
+)
+
+
 def _tar_filter(member, dest_path):
     # Use data_filter for path traversal / special file protection, but skip
     # symlinks that point to absolute or out-of-destination paths -- these are
     # system-specific (e.g. .venv/bin/python -> /usr/bin/python3.14) and would
     # be broken on a different machine anyway.
     try:
-        return tarfile.data_filter(member, dest_path)
+        result = tarfile.data_filter(member, dest_path)
     except (tarfile.AbsoluteLinkError, tarfile.LinkOutsideDestinationError):
         return None
+    if result is None:
+        return None
+    if sys.platform == "win32":
+        # Symlink creation on Windows requires Developer Mode or elevation.
+        if result.issym() or result.islnk():
+            return None
+        # Skip entries whose name components match Windows reserved device names.
+        for part in Path(result.name).parts:
+            if _WIN_RESERVED.match(part):
+                return None
+    return result
 
+
+
+def _proc_alive(pid: int) -> bool:
+    """Check whether a process is running without sending it a signal."""
+    if sys.platform == "win32":
+        import ctypes
+        import ctypes.wintypes
+        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        STILL_ACTIVE = 259
+        h = ctypes.windll.kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+        if not h:
+            return False
+        try:
+            code = ctypes.wintypes.DWORD()
+            ctypes.windll.kernel32.GetExitCodeProcess(h, ctypes.byref(code))
+            return code.value == STILL_ACTIVE
+        finally:
+            ctypes.windll.kernel32.CloseHandle(h)
+    else:
+        try:
+            os.kill(pid, 0)
+            return True
+        except (ProcessLookupError, OSError):
+            return False
+
+
+def _proc_terminate(pid: int) -> None:
+    """Terminate a process by PID, cross-platform."""
+    if sys.platform == "win32":
+        import ctypes
+        PROCESS_TERMINATE = 0x0001
+        h = ctypes.windll.kernel32.OpenProcess(PROCESS_TERMINATE, False, pid)
+        if h:
+            try:
+                ctypes.windll.kernel32.TerminateProcess(h, 0)
+            finally:
+                ctypes.windll.kernel32.CloseHandle(h)
+    else:
+        os.kill(pid, signal.SIGTERM)
+
+
+def _daemon_popen_kwargs() -> dict:
+    """Return platform-appropriate Popen kwargs for background daemon spawning."""
+    if sys.platform == "win32":
+        # start_new_session and creationflags are mutually exclusive in Python.
+        # CREATE_NEW_PROCESS_GROUP prevents Ctrl+C propagation from the parent.
+        # CREATE_NO_WINDOW suppresses a spurious console window on Windows.
+        return {
+            "creationflags": subprocess.CREATE_NEW_PROCESS_GROUP
+            | subprocess.CREATE_NO_WINDOW,
+        }
+    return {"start_new_session": True}
+
+
+def _is_private_ip(addr: str) -> bool:
+    try:
+        ip = ipaddress.ip_address(addr)
+        return any(ip in net for net in _PRIVATE_NETS)
+    except ValueError:
+        return False
 
 
 def _post(url, headers):
@@ -928,9 +1066,8 @@ def _is_daemon_running():
         return False
     try:
         pid = int(PID_FILE.read_text().strip())
-        os.kill(pid, 0)
-        return True
-    except (ProcessLookupError, OSError, ValueError):
+        return _proc_alive(pid)
+    except (OSError, ValueError):
         return False
 
 
