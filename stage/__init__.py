@@ -11,6 +11,7 @@ import tarfile
 import tempfile
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib import request as urllib_request
@@ -39,6 +40,7 @@ class StageApp:
         self.console = Console()
         self.err_console = Console(stderr=True)
         self._config_cache = None
+        self._print_lock = threading.Lock()
 
     @property
     def config(self):
@@ -115,24 +117,32 @@ class StageApp:
             if not path.exists():
                 self.die(f"Not found: {p}")
             if path.is_dir():
-                with Status(f"Sizing [bold]{path.name}/[/bold]...", console=self.console):
-                    size = _dir_size(path)
+                with Status(
+                    f"Sizing [bold]{path.name}/[/bold]...", console=self.console
+                ):
+                    size, file_count = _dir_stats(path)
                 self.console.print(
-                    f"Staged [bold]{path.name}/[/bold] ([cyan]{_human_size(size)}[/cyan])"
+                    f"Staged [bold]{path.name}/[/bold]"
+                    f" ([cyan]{_human_size(size)}[/cyan], {file_count} files)"
                 )
-                files.append({
-                    "name": path.name,
-                    "path": str(path),
-                    "size": size,
-                    "type": "dir",
-                })
+                files.append(
+                    {
+                        "name": path.name,
+                        "path": str(path),
+                        "size": size,
+                        "file_count": file_count,
+                        "type": "dir",
+                    }
+                )
             elif path.is_file():
-                files.append({
-                    "name": path.name,
-                    "path": str(path),
-                    "size": path.stat().st_size,
-                    "type": "file",
-                })
+                files.append(
+                    {
+                        "name": path.name,
+                        "path": str(path),
+                        "size": path.stat().st_size,
+                        "type": "file",
+                    }
+                )
             else:
                 self.die(f"Not a file or directory: {p}")
 
@@ -152,47 +162,62 @@ class StageApp:
         )
         PID_FILE.write_text(str(proc.pid))
 
-        for _ in range(20):
-            time.sleep(0.25)
+        try:
+            for _ in range(20):
+                time.sleep(0.25)
+                try:
+                    urllib_request.urlopen(f"http://127.0.0.1:{port}/health", timeout=1)
+                    break
+                except Exception:
+                    pass
+            else:
+                if not _is_daemon_running():
+                    MANIFEST_FILE.unlink(missing_ok=True)
+                    PID_FILE.unlink(missing_ok=True)
+                    self.die(
+                        f"Failed to start staging server. Is port {port} already in use?"
+                    )
+
+            pub_ip = [None]
+            if self.config["stage"].get("public_ip_check"):
+                t = threading.Thread(
+                    target=lambda: pub_ip.__setitem__(0, _public_ip()), daemon=True
+                )
+                t.start()
+                t.join(timeout=4)
+
+            total = sum(f["size"] for f in files)
+            names = ", ".join(
+                f["name"] + ("/" if f.get("type") == "dir" else "") for f in files
+            )
+            pull_s = "pull" if n == 1 else "pulls"
+            self.console.print(
+                f"\nStaged: [bold]{names}[/bold] ([cyan]{_human_size(total)}[/cyan], {n} {pull_s} allowed)\n"
+            )
+
+            ts_ip, _peers = _tailscale_info()
+            local_ips = [ip for ip in _local_ips() if ip != ts_ip]
+
+            if ts_ip:
+                self.console.print("  Via Tailscale:  [bold]stage pull[/bold]")
+            for ip in local_ips:
+                self.console.print(f"  Direct:         [bold]stage pull {ip}:{port}[/bold]")
+            if pub_ip[0]:
+                self.console.print(
+                    f"  Public IP:      [bold]stage pull {pub_ip[0]}:{port}[/bold]"
+                )
+            if not ts_ip and not local_ips and not pub_ip[0]:
+                self.console.print(f"  [bold]stage pull <this-machine-ip>:{port}[/bold]")
+
+        except KeyboardInterrupt:
             try:
-                urllib_request.urlopen(f"http://127.0.0.1:{port}/health", timeout=1)
-                break
+                proc.terminate()
             except Exception:
                 pass
-        else:
-            if not _is_daemon_running():
-                MANIFEST_FILE.unlink(missing_ok=True)
-                PID_FILE.unlink(missing_ok=True)
-                self.die(f"Failed to start staging server. Is port {port} already in use?")
-
-        pub_ip = [None]
-        if self.config["stage"].get("public_ip_check"):
-            t = threading.Thread(
-                target=lambda: pub_ip.__setitem__(0, _public_ip()), daemon=True
-            )
-            t.start()
-            t.join(timeout=4)
-
-        total = sum(f["size"] for f in files)
-        names = ", ".join(
-            f["name"] + ("/" if f.get("type") == "dir" else "") for f in files
-        )
-        pull_s = "pull" if n == 1 else "pulls"
-        self.console.print(
-            f"\nStaged: [bold]{names}[/bold] ([cyan]{_human_size(total)}[/cyan], {n} {pull_s} allowed)\n"
-        )
-
-        ts_ip, _peers = _tailscale_info()
-        local_ips = [ip for ip in _local_ips() if ip != ts_ip]
-
-        if ts_ip:
-            self.console.print("  Via Tailscale:  [bold]stage pull[/bold]")
-        for ip in local_ips:
-            self.console.print(f"  Direct:         [bold]stage pull {ip}:{port}[/bold]")
-        if pub_ip[0]:
-            self.console.print(f"  Public IP:      [bold]stage pull {pub_ip[0]}:{port}[/bold]")
-        if not ts_ip and not local_ips and not pub_ip[0]:
-            self.console.print(f"  [bold]stage pull <this-machine-ip>:{port}[/bold]")
+            MANIFEST_FILE.unlink(missing_ok=True)
+            PID_FILE.unlink(missing_ok=True)
+            print()
+            sys.exit(130)
 
     # -------------------------------------------------------------------------
     # Daemon
@@ -222,17 +247,17 @@ class StageApp:
                     return
                 path = unquote(self.path.lstrip("/"))
                 if path in ("manifest", "status"):
-                    body = json.dumps({
-                        "files": [
-                            {
-                                "name": e["name"],
-                                "type": e.get("type", "file"),
-                                "size": e["size"],
-                            }
-                            for e in entries.values()
-                        ],
-                        "pulls_remaining": pulls_remaining[0],
-                    }).encode()
+                    def _entry_meta(e):
+                        m = {"name": e["name"], "type": e.get("type", "file"), "size": e["size"]}
+                        if "file_count" in e:
+                            m["file_count"] = e["file_count"]
+                        return m
+                    body = json.dumps(
+                        {
+                            "files": [_entry_meta(e) for e in entries.values()],
+                            "pulls_remaining": pulls_remaining[0],
+                        }
+                    ).encode()
                     self._respond(200, "application/json", body)
                 elif path.startswith("files/"):
                     name = path[6:]
@@ -245,16 +270,17 @@ class StageApp:
                         self.send_error(410)
                         return
                     if entry.get("type") == "dir":
-                        # Stream the directory as a tar.gz on demand rather than
-                        # pre-archiving at stage time. Connection: close is required
-                        # because we don't know Content-Length for the stream.
+                        # Stream directory as uncompressed tar on demand. Gzip saves
+                        # bandwidth but costs more CPU than it saves on fast LAN/Tailscale
+                        # links, especially for directories with many small files.
+                        # Connection: close is required because we don't know Content-Length.
                         self.send_response(200)
                         self.send_header("Content-Type", "application/x-tar")
                         self.send_header("Connection", "close")
                         self.close_connection = True
                         self.end_headers()
                         try:
-                            with tarfile.open(fileobj=self.wfile, mode="w|gz") as tar:
+                            with tarfile.open(fileobj=self.wfile, mode="w|") as tar:
                                 tar.add(fp, arcname=fp.name)
                         except (BrokenPipeError, ConnectionResetError):
                             pass
@@ -363,7 +389,9 @@ class StageApp:
             except Exception:
                 pass
 
-        threads = [threading.Thread(target=probe, args=(ip,), daemon=True) for ip in peers]
+        threads = [
+            threading.Thread(target=probe, args=(ip,), daemon=True) for ip in peers
+        ]
         for t in threads:
             t.start()
         found.wait(timeout=PROBE_TIMEOUT + 1)
@@ -408,33 +436,99 @@ class StageApp:
         self.console.print(table)
 
         cwd = Path.cwd()
-        success = True
-        for entry in file_entries:
+
+        # Pre-assign destination paths sequentially to avoid name-collision races
+        # between concurrent downloads.
+        assignments = [
+            (entry, _unique_path(cwd / entry["name"])) for entry in file_entries
+        ]
+
+        parallel = len(assignments) > 1
+        errors = []
+
+        def fetch(entry, dest):
             name = entry["name"]
             entry_type = entry.get("type", "file")
             encoded = quote(name, safe="")
+            show_progress = not parallel
             try:
                 req = urllib_request.Request(f"{base}/files/{encoded}", headers=headers)
                 resp = urllib_request.urlopen(req, timeout=300)
                 if entry_type == "dir":
-                    with tempfile.NamedTemporaryFile(suffix=".tar.gz", delete=False) as tmp:
-                        tmp_path = Path(tmp.name)
-                    try:
-                        self._download(resp, tmp_path, name, suffix="")
-                        target = _unique_path(cwd / name)
-                        _extract_archive(tmp_path, target)
-                        rename = f" -> {target.name}/" if target.name != name else ""
-                        self.console.print(f"  extracted [bold]{name}/[/bold]{rename}")
-                    finally:
-                        tmp_path.unlink(missing_ok=True)
-                else:
-                    dest = _unique_path(cwd / name)
-                    self._download(resp, dest, name)
-            except (URLError, OSError) as e:
-                self.err_console.print(f"\n[red]{name}: failed: {e}[/red]")
-                success = False
+                    total_bytes = entry.get("size") or None
+                    total_files = entry.get("file_count")
+                    files_done = 0
+                    with tqdm(
+                        total=total_bytes,
+                        unit="B",
+                        unit_scale=True,
+                        unit_divisor=1024,
+                        desc=name,
+                        ncols=80,
+                        leave=False,
+                        file=sys.stderr,
+                        disable=not show_progress,
+                    ) as bar:
+                        class _Reader:
+                            def read(self, n=-1):
+                                chunk = resp.read(n)
+                                if chunk:
+                                    bar.update(len(chunk))
+                                return chunk
 
-        if success:
+                        with tempfile.TemporaryDirectory() as tmp_dir:
+                            with tarfile.open(fileobj=_Reader(), mode="r|") as tar:
+                                for member in tar:
+                                    tar.extract(member, tmp_dir, filter=_tar_filter)
+                                    if member.isfile():
+                                        files_done += 1
+                                        if total_files and show_progress:
+                                            bar.set_postfix_str(
+                                                f"{files_done}/{total_files} files",
+                                                refresh=False,
+                                            )
+                            items = list(Path(tmp_dir).iterdir())
+                            if len(items) == 1 and items[0].is_dir():
+                                shutil.move(str(items[0]), str(dest))
+                            else:
+                                dest.mkdir(parents=True, exist_ok=True)
+                                for item in items:
+                                    shutil.move(str(item), str(dest / item.name))
+
+                    rename = f" -> {dest.name}/" if dest.name != name else ""
+                    with self._print_lock:
+                        self.console.print(f"  extracted [bold]{name}/[/bold]{rename}")
+                else:
+                    self._download(resp, dest, name, show_progress=show_progress)
+                return None
+            except (URLError, OSError, tarfile.TarError) as e:
+                return (name, e)
+
+        n_workers = min(4, len(assignments))
+        executor = ThreadPoolExecutor(max_workers=n_workers)
+        futures = {executor.submit(fetch, entry, dest): entry for entry, dest in assignments}
+        try:
+            for fut in as_completed(futures):
+                err = fut.result()
+                if err:
+                    name, exc = err
+                    with self._print_lock:
+                        self.err_console.print(f"\n[red]{name}: failed: {exc}[/red]")
+                    errors.append(name)
+        except KeyboardInterrupt:
+            for fut in futures:
+                fut.cancel()
+            executor.shutdown(wait=False, cancel_futures=True)
+            try:
+                _post(f"{base}/cancel", headers)
+            except Exception:
+                pass
+            self.console.print("\n[yellow]Pull interrupted.[/yellow]")
+            os._exit(130)
+        else:
+            executor.shutdown(wait=True)
+
+        if not errors:
             resp = _post(f"{base}/done", headers)
             remaining = json.loads(resp.read()).get("pulls_remaining", 0)
             n = len(file_entries)
@@ -443,14 +537,16 @@ class StageApp:
                 if remaining > 0
                 else " [dim]Session closed.[/dim]"
             )
-            self.console.print(f"\nPulled [bold]{n}[/bold] item{'s' if n != 1 else ''}.{suffix}")
+            self.console.print(
+                f"\nPulled [bold]{n}[/bold] item{'s' if n != 1 else ''}.{suffix}"
+            )
         else:
             self.err_console.print(
                 "[red]Some items failed. Session remains open for retry.[/red]"
             )
             sys.exit(1)
 
-    def _download(self, resp, dest, name, suffix=None):
+    def _download(self, resp, dest, name, suffix=None, show_progress=True):
         total = int(resp.headers.get("Content-Length", 0)) or None
         downloaded = 0
         start = time.monotonic()
@@ -464,6 +560,7 @@ class StageApp:
             ncols=80,
             leave=False,
             file=sys.stderr,
+            disable=not show_progress,
         ) as bar:
             with open(dest, "wb") as f:
                 while chunk := resp.read(65536):
@@ -475,10 +572,11 @@ class StageApp:
         speed = downloaded / elapsed
         if suffix is None:
             suffix = f" -> {dest.name}" if dest.name != name else ""
-        self.console.print(
-            f"  {name}{suffix}  [cyan]{_human_size(downloaded)}[/cyan]"
-            f" at [cyan]{_human_size(speed)}/s[/cyan]"
-        )
+        with self._print_lock:
+            self.console.print(
+                f"  {name}{suffix}  [cyan]{_human_size(downloaded)}[/cyan]"
+                f" at [cyan]{_human_size(speed)}/s[/cyan]"
+            )
 
     # -------------------------------------------------------------------------
     # Status / Clear
@@ -642,7 +740,9 @@ class StageApp:
                 if new_sha:
                     state = _load_update_state()
                     state.update(
-                        installed_sha=new_sha, latest_sha=new_sha, last_checked=time.time()
+                        installed_sha=new_sha,
+                        latest_sha=new_sha,
+                        last_checked=time.time(),
                     )
                     _save_update_state(state)
                     if old_sha and old_sha != new_sha:
@@ -733,8 +833,12 @@ class StageApp:
         self.console.print(
             "  stage status [<host>[:<port>]]     Show active staging session info"
         )
-        self.console.print("  stage clear                        Cancel active staging session")
-        self.console.print("  stage update                       Upgrade to the latest version")
+        self.console.print(
+            "  stage clear                        Cancel active staging session"
+        )
+        self.console.print(
+            "  stage update                       Upgrade to the latest version"
+        )
         self.console.print(
             "  stage provision                    Print one-liner to configure a new machine"
         )
@@ -747,9 +851,15 @@ class StageApp:
 # Module-level pure helpers (no app state)
 # =============================================================================
 
-def _dir_size(path: Path) -> int:
-    """Sum file sizes under path without reading file contents (stat only)."""
-    return sum(f.stat().st_size for f in path.rglob("*") if f.is_file())
+
+def _dir_stats(path: Path) -> tuple[int, int]:
+    """Return (total_bytes, file_count) via stat-only walk (no file reads)."""
+    size = count = 0
+    for f in path.rglob("*"):
+        if f.is_file():
+            size += f.stat().st_size
+            count += 1
+    return size, count
 
 
 def _tailscale_info():
@@ -789,19 +899,6 @@ def _tar_filter(member, dest_path):
     except (tarfile.AbsoluteLinkError, tarfile.LinkOutsideDestinationError):
         return None
 
-
-def _extract_archive(archive_path, target):
-    """Extract a tar.gz so its root directory lands at target."""
-    with tempfile.TemporaryDirectory() as tmp:
-        with tarfile.open(archive_path, "r:gz") as tar:
-            tar.extractall(tmp, filter=_tar_filter)
-        items = list(Path(tmp).iterdir())
-        if len(items) == 1 and items[0].is_dir():
-            shutil.move(str(items[0]), str(target))
-        else:
-            target.mkdir(parents=True, exist_ok=True)
-            for item in items:
-                shutil.move(str(item), str(target / item.name))
 
 
 def _post(url, headers):
