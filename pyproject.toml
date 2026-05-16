@@ -5,6 +5,9 @@ description = "Direct file transfer between machines via Tailscale or direct con
 requires-python = ">=3.14"
 dependencies = ["rich", "tqdm"]
 
+[project.optional-dependencies]
+upnp = ["miniupnpc"]
+
 [project.scripts]
 stage = "stage:main"
 

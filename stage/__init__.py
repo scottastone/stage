@@ -33,6 +33,7 @@ PID_FILE = STAGE_DIR / "daemon.pid"
 MANIFEST_FILE = STAGE_DIR / "manifest.json"
 UPDATE_FILE = STAGE_DIR / "update.json"
 PEERS_FILE = STAGE_DIR / "peers.json"
+UPNP_FILE = STAGE_DIR / "upnp.json"
 DEFAULT_PORT = 47200
 PROBE_TIMEOUT = 3
 UPDATE_INTERVAL = 86400
@@ -246,13 +247,29 @@ class StageApp:
                         f"Failed to start staging server. Is port {port} already in use?"
                     )
 
+            # Run UPnP forwarding and public-IP lookup concurrently so neither
+            # blocks the other. UPnP discovery typically takes ~500 ms.
+            upnp_info = [None]
             pub_ip = [None]
+            bg = []
+            if public:
+                t = threading.Thread(
+                    target=lambda: upnp_info.__setitem__(0, _try_upnp_forward(port)),
+                    daemon=True,
+                )
+                t.start()
+                bg.append(t)
             if self.config["stage"].get("public_ip_check"):
                 t = threading.Thread(
                     target=lambda: pub_ip.__setitem__(0, _public_ip()), daemon=True
                 )
                 t.start()
-                t.join(timeout=4)
+                bg.append(t)
+            for t in bg:
+                t.join(timeout=5)
+
+            if upnp_info[0]:
+                UPNP_FILE.write_text(json.dumps(upnp_info[0]))
 
             if not quiet:
                 total = sum(f["size"] for f in files)
@@ -281,17 +298,32 @@ class StageApp:
                     self.console.print(
                         f"  Direct:         [bold]stage pull {ip}:{port}[/bold]"
                     )
-                if pub_ip[0]:
+
+                if upnp_info[0]:
+                    u = upnp_info[0]
+                    self.console.print(
+                        f"  Internet:       [bold]stage pull {u['external_ip']}:{u['external_port']}[/bold]"
+                        f"  [green](UPnP port forwarded)[/green]"
+                    )
+                elif pub_ip[0]:
                     if public:
                         self.console.print(
                             f"  Public IP:      [bold]stage pull {pub_ip[0]}:{port}[/bold]"
+                            f"  [dim](check firewall / NAT)[/dim]"
                         )
                     else:
                         self.console.print(
                             f"  Public IP:      [dim]{pub_ip[0]}:{port}"
                             f" (add --public to accept)[/dim]"
                         )
-                if not ts_ip and not local_ips and not pub_ip[0]:
+
+                if public and not upnp_info[0]:
+                    self.console.print(
+                        "  UPnP:           [dim]not available"
+                        " (install miniupnpc or check router settings)[/dim]"
+                    )
+
+                if not ts_ip and not local_ips and not pub_ip[0] and not upnp_info[0]:
                     self.console.print(
                         f"  [bold]stage pull <this-machine-ip>:{port}[/bold]"
                     )
@@ -301,8 +333,11 @@ class StageApp:
                 proc.terminate()
             except Exception:
                 pass
+            if upnp_info[0]:
+                _remove_upnp_forward(upnp_info[0])
             MANIFEST_FILE.unlink(missing_ok=True)
             PID_FILE.unlink(missing_ok=True)
+            UPNP_FILE.unlink(missing_ok=True)
             print()
             sys.exit(130)
 
@@ -327,156 +362,17 @@ class StageApp:
         if hasattr(signal, "SIGBREAK"):
             signal.signal(signal.SIGBREAK, _shutdown)
 
-        class Handler(BaseHTTPRequestHandler):
-            def log_message(self, *args):
-                pass
-
-            def _allowed_client(self):
-                if public:
-                    return True
-                if _is_private_ip(self.client_address[0]):
-                    return True
-                self.send_error(403)
-                return False
-
-            def do_GET(self):
-                if self.path == "/health":
-                    # Only respond to localhost; external probing reveals the
-                    # daemon is running without any authentication.
-                    if self.client_address[0] == "127.0.0.1":
-                        self._respond(200, "text/plain", b"ok")
-                    else:
-                        self.send_error(404)
-                    return
-                if not self._allowed_client():
-                    return
-                if not self._auth():
-                    return
-                path = unquote(self.path.lstrip("/"))
-                if path in ("manifest", "status"):
-
-                    def _entry_meta(e):
-                        m = {
-                            "name": e["name"],
-                            "type": e.get("type", "file"),
-                            "size": e["size"],
-                        }
-                        if "file_count" in e:
-                            m["file_count"] = e["file_count"]
-                        return m
-
-                    with entries_lock:
-                        file_list = [_entry_meta(e) for e in entries.values()]
-                    body = json.dumps(
-                        {
-                            "files": file_list,
-                            "pulls_remaining": pulls_remaining[0],
-                            "compress": compress,
-                        }
-                    ).encode()
-                    self._respond(200, "application/json", body)
-                elif path.startswith("files/"):
-                    name = path[6:]
-                    with entries_lock:
-                        entry = entries.get(name)
-                    if entry is None:
-                        self.send_error(404)
-                        return
-                    fp = Path(entry["path"])
-                    if not fp.exists():
-                        self.send_error(410)
-                        return
-                    if entry.get("type") == "dir":
-                        # Connection: close is required because Content-Length is unknown.
-                        # compress=True uses gzip; default is uncompressed (fast LAN/VPN).
-                        tar_mode = "w|gz" if compress else "w|"
-                        self.send_response(200)
-                        self.send_header("Content-Type", "application/x-tar")
-                        self.send_header("Connection", "close")
-                        self.close_connection = True
-                        self.end_headers()
-                        try:
-                            with tarfile.open(fileobj=self.wfile, mode=tar_mode) as tar:
-                                tar.add(fp, arcname=fp.name)
-                        except OSError:
-                            # Covers client disconnect (BrokenPipeError,
-                            # ConnectionResetError) on both POSIX and Windows.
-                            pass
-                    else:
-                        self.send_response(200)
-                        self.send_header("Content-Type", "application/octet-stream")
-                        if compress:
-                            self.send_header("Connection", "close")
-                            self.close_connection = True
-                        else:
-                            self.send_header("Content-Length", str(fp.stat().st_size))
-                        self.end_headers()
-                        try:
-                            if compress:
-                                with open(fp, "rb") as f:
-                                    with gzip.GzipFile(fileobj=self.wfile, mode="wb") as gz:
-                                        while chunk := f.read(65536):
-                                            gz.write(chunk)
-                            else:
-                                with open(fp, "rb") as f:
-                                    while chunk := f.read(65536):
-                                        self.wfile.write(chunk)
-                        except OSError:
-                            # Same as above; also covers TOCTOU FileNotFoundError.
-                            pass
-                else:
-                    self.send_error(404)
-
-            def do_POST(self):
-                if not self._allowed_client():
-                    return
-                if not self._auth():
-                    return
-                if self.path == "/done":
-                    pulls_remaining[0] -= 1
-                    remaining = pulls_remaining[0]
-                    self._respond(
-                        200,
-                        "application/json",
-                        json.dumps({"pulls_remaining": remaining}).encode(),
-                    )
-                    if remaining <= 0:
-                        done_event.set()
-                elif self.path == "/cancel":
-                    self._respond(200, "text/plain", b"cancelled")
-                    done_event.set()
-                elif self.path == "/amend":
-                    length = int(self.headers.get("Content-Length", 0))
-                    new_files = json.loads(self.rfile.read(length)).get("files", [])
-                    with entries_lock:
-                        for f in new_files:
-                            entries[f["name"]] = f
-                        all_files = list(entries.values())
-                    MANIFEST_FILE.write_text(
-                        json.dumps({"files": all_files, "compress": compress}, indent=2)
-                    )
-                    self._respond(
-                        200,
-                        "application/json",
-                        json.dumps({"files": list(entries.keys())}).encode(),
-                    )
-                else:
-                    self.send_error(404)
-
-            def _auth(self):
-                if self.headers.get("Authorization") != f"Bearer {token}":
-                    self.send_error(401)
-                    return False
-                return True
-
-            def _respond(self, code, ctype, body):
-                self.send_response(code)
-                self.send_header("Content-Type", ctype)
-                self.send_header("Content-Length", str(len(body)))
-                self.end_headers()
-                self.wfile.write(body)
-
-        server = ThreadingHTTPServer(("0.0.0.0", port), Handler)
+        server = _StagingServer(
+            ("0.0.0.0", port),
+            _StagingHandler,
+            token=token,
+            entries=entries,
+            entries_lock=entries_lock,
+            compress=compress,
+            pulls_remaining=pulls_remaining,
+            done_event=done_event,
+            public=public,
+        )
         threading.Thread(target=server.serve_forever, daemon=True).start()
 
         try:
@@ -485,6 +381,12 @@ class StageApp:
             server.shutdown()
             MANIFEST_FILE.unlink(missing_ok=True)
             PID_FILE.unlink(missing_ok=True)
+            if UPNP_FILE.exists():
+                try:
+                    _remove_upnp_forward(json.loads(UPNP_FILE.read_text()))
+                except Exception:
+                    pass
+                UPNP_FILE.unlink(missing_ok=True)
 
     # -------------------------------------------------------------------------
     # Session discovery
@@ -1376,6 +1278,240 @@ def _remote_sha(repo):
     except (FileNotFoundError, subprocess.TimeoutExpired, IndexError):
         pass
     return None
+
+
+# =============================================================================
+# UPnP helpers
+# =============================================================================
+
+
+def _try_upnp_forward(port: int) -> dict | None:
+    """Attempt to open a UPnP port mapping. Returns mapping info or None."""
+    try:
+        import miniupnpc  # optional dependency
+    except ImportError:
+        return None
+    try:
+        u = miniupnpc.UPnP()
+        u.discoverdelay = 500
+        if u.discover() == 0:
+            return None
+        u.selectigd()
+        external_ip = u.externalipaddress()
+        internal_ip = u.lanaddr
+        u.addportmapping(port, "TCP", internal_ip, port, "stage", "")
+        return {
+            "external_ip": external_ip,
+            "external_port": port,
+            "internal_ip": internal_ip,
+            "internal_port": port,
+        }
+    except Exception:
+        return None
+
+
+def _remove_upnp_forward(info: dict) -> None:
+    """Remove a UPnP port mapping previously created by _try_upnp_forward."""
+    try:
+        import miniupnpc  # optional dependency
+    except ImportError:
+        return
+    try:
+        u = miniupnpc.UPnP()
+        u.discoverdelay = 500
+        if u.discover() == 0:
+            return
+        u.selectigd()
+        u.deleteportmapping(info["external_port"], "TCP")
+    except Exception:
+        pass
+
+
+# =============================================================================
+# HTTP server (extracted from _run_daemon to reduce cyclomatic complexity)
+# =============================================================================
+
+
+class _StagingServer(ThreadingHTTPServer):
+    """ThreadingHTTPServer that carries shared session state for _StagingHandler."""
+
+    def __init__(
+        self,
+        server_address,
+        RequestHandlerClass,
+        *,
+        token: str,
+        entries: dict,
+        entries_lock: threading.Lock,
+        compress: bool,
+        pulls_remaining: list,
+        done_event: threading.Event,
+        public: bool,
+    ):
+        super().__init__(server_address, RequestHandlerClass)
+        self.token = token
+        self.entries = entries
+        self.entries_lock = entries_lock
+        self.compress = compress
+        self.pulls_remaining = pulls_remaining
+        self.done_event = done_event
+        self.public = public
+
+
+class _StagingHandler(BaseHTTPRequestHandler):
+    def log_message(self, format: str, *args) -> None:  # noqa: A002
+        pass
+
+    def _allowed_client(self) -> bool:
+        if self.server.public:
+            return True
+        if _is_private_ip(self.client_address[0]):
+            return True
+        self.send_error(403)
+        return False
+
+    def _auth(self) -> bool:
+        if self.headers.get("Authorization") != f"Bearer {self.server.token}":
+            self.send_error(401)
+            return False
+        return True
+
+    def _respond(self, code: int, ctype: str, body: bytes) -> None:
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    @staticmethod
+    def _entry_meta(e: dict) -> dict:
+        m = {"name": e["name"], "type": e.get("type", "file"), "size": e["size"]}
+        if "file_count" in e:
+            m["file_count"] = e["file_count"]
+        return m
+
+    def do_GET(self) -> None:
+        if self.path == "/health":
+            # Only respond to localhost; external probing reveals the daemon
+            # is running without any authentication.
+            if self.client_address[0] == "127.0.0.1":
+                self._respond(200, "text/plain", b"ok")
+            else:
+                self.send_error(404)
+            return
+        if not self._allowed_client():
+            return
+        if not self._auth():
+            return
+        path = unquote(self.path.lstrip("/"))
+        if path in ("manifest", "status"):
+            with self.server.entries_lock:
+                file_list = [self._entry_meta(e) for e in self.server.entries.values()]
+            body = json.dumps(
+                {
+                    "files": file_list,
+                    "pulls_remaining": self.server.pulls_remaining[0],
+                    "compress": self.server.compress,
+                }
+            ).encode()
+            self._respond(200, "application/json", body)
+        elif path.startswith("files/"):
+            self._serve_file(path[6:])
+        else:
+            self.send_error(404)
+
+    def _serve_file(self, name: str) -> None:
+        with self.server.entries_lock:
+            entry = self.server.entries.get(name)
+        if entry is None:
+            self.send_error(404)
+            return
+        fp = Path(entry["path"])
+        if not fp.exists():
+            self.send_error(410)
+            return
+        if entry.get("type") == "dir":
+            self._serve_dir(fp)
+        else:
+            self._serve_regular_file(fp)
+
+    def _serve_dir(self, fp: Path) -> None:
+        # Connection: close is required because Content-Length is unknown.
+        # compress=True uses gzip; default is uncompressed (fast LAN/VPN).
+        tar_mode = "w|gz" if self.server.compress else "w|"
+        self.send_response(200)
+        self.send_header("Content-Type", "application/x-tar")
+        self.send_header("Connection", "close")
+        self.close_connection = True
+        self.end_headers()
+        try:
+            with tarfile.open(fileobj=self.wfile, mode=tar_mode) as tar:
+                tar.add(fp, arcname=fp.name)
+        except OSError:
+            # Covers client disconnect (BrokenPipeError, ConnectionResetError)
+            # on both POSIX and Windows.
+            pass
+
+    def _serve_regular_file(self, fp: Path) -> None:
+        self.send_response(200)
+        self.send_header("Content-Type", "application/octet-stream")
+        if self.server.compress:
+            self.send_header("Connection", "close")
+            self.close_connection = True
+        else:
+            self.send_header("Content-Length", str(fp.stat().st_size))
+        self.end_headers()
+        try:
+            if self.server.compress:
+                with open(fp, "rb") as f:
+                    with gzip.GzipFile(fileobj=self.wfile, mode="wb") as gz:
+                        while chunk := f.read(65536):
+                            gz.write(chunk)
+            else:
+                with open(fp, "rb") as f:
+                    while chunk := f.read(65536):
+                        self.wfile.write(chunk)
+        except OSError:
+            # Same as above; also covers TOCTOU FileNotFoundError.
+            pass
+
+    def do_POST(self) -> None:
+        if not self._allowed_client():
+            return
+        if not self._auth():
+            return
+        if self.path == "/done":
+            self.server.pulls_remaining[0] -= 1
+            remaining = self.server.pulls_remaining[0]
+            self._respond(
+                200,
+                "application/json",
+                json.dumps({"pulls_remaining": remaining}).encode(),
+            )
+            if remaining <= 0:
+                self.server.done_event.set()
+        elif self.path == "/cancel":
+            self._respond(200, "text/plain", b"cancelled")
+            self.server.done_event.set()
+        elif self.path == "/amend":
+            length = int(self.headers.get("Content-Length", 0))
+            new_files = json.loads(self.rfile.read(length)).get("files", [])
+            with self.server.entries_lock:
+                for f in new_files:
+                    self.server.entries[f["name"]] = f
+                all_files = list(self.server.entries.values())
+            MANIFEST_FILE.write_text(
+                json.dumps(
+                    {"files": all_files, "compress": self.server.compress}, indent=2
+                )
+            )
+            self._respond(
+                200,
+                "application/json",
+                json.dumps({"files": list(self.server.entries.keys())}).encode(),
+            )
+        else:
+            self.send_error(404)
 
 
 def main():

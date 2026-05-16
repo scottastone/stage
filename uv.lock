@@ -33,6 +33,12 @@ wheels = [
 ]
 
 [[package]]
+name = "miniupnpc"
+version = "2.3.3"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/73/8f/4d7964914386dcd82da566e04af9a8744d2025e2d68fa37689d5c4e152cf/miniupnpc-2.3.3.tar.gz", hash = "sha256:ee5e957df828d2fa1cc364e60c583d10439110888f086c9182071c96a374b2ad", size = 79010, upload-time = "2025-05-26T23:01:39.214Z" }
+
+[[package]]
 name = "pygments"
 version = "2.20.0"
 source = { registry = "https://pypi.org/simple" }
@@ -63,11 +69,18 @@ dependencies = [
     { name = "tqdm" },
 ]
 
+[package.optional-dependencies]
+upnp = [
+    { name = "miniupnpc" },
+]
+
 [package.metadata]
 requires-dist = [
+    { name = "miniupnpc", marker = "extra == 'upnp'" },
     { name = "rich" },
     { name = "tqdm" },
 ]
+provides-extras = ["upnp"]
 
 [[package]]
 name = "tqdm"
