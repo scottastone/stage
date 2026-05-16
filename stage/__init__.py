@@ -318,10 +318,15 @@ class StageApp:
                         )
 
                 if public and not upnp_info[0]:
-                    self.console.print(
-                        "  UPnP:           [dim]not available"
-                        " (install miniupnpc or check router settings)[/dim]"
-                    )
+                    if not _upnp_available():
+                        self.console.print(
+                            "  UPnP:           [dim]not enabled --"
+                            " run [bold]uv tool inject stage miniupnpc[/bold] to enable[/dim]"
+                        )
+                    else:
+                        self.console.print(
+                            "  UPnP:           [dim]no compatible router found[/dim]"
+                        )
 
                 if not ts_ip and not local_ips and not pub_ip[0] and not upnp_info[0]:
                     self.console.print(
@@ -1285,8 +1290,19 @@ def _remote_sha(repo):
 # =============================================================================
 
 
+def _upnp_available() -> bool:
+    """Return True if miniupnpc is importable."""
+    try:
+        import miniupnpc  # noqa: F401
+        return True
+    except ImportError:
+        return False
+
+
 def _try_upnp_forward(port: int) -> dict | None:
-    """Attempt to open a UPnP port mapping. Returns mapping info or None."""
+    """Attempt to open a UPnP port mapping. Returns mapping info or None.
+    Callers should check _upnp_available() first to distinguish 'not installed'
+    from 'installed but no compatible router found'."""
     try:
         import miniupnpc  # optional dependency
     except ImportError:
