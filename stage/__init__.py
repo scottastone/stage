@@ -1,4 +1,5 @@
-import gzip
+import hashlib
+import hmac
 import ipaddress
 import json
 import os
@@ -7,12 +8,14 @@ import secrets
 import shutil
 import signal
 import socket
+import ssl
 import subprocess
 import sys
 import tarfile
 import tempfile
 import threading
 import time
+from compression import zstd
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -38,6 +41,21 @@ DEFAULT_PORT = 47200
 PROBE_TIMEOUT = 3
 UPDATE_INTERVAL = 86400
 
+# I/O chunk size for file streaming and tar stream buffering.
+CHUNK_SIZE = 1 << 20
+# Single files at least this large are fetched as parallel byte ranges.
+RANGED_MIN_SIZE = 64 << 20
+RANGED_PART_SIZE = 32 << 20
+RANGED_MAX_PARTS = 4
+
+_PSK_IDENTITY = "stage"
+_ZSTD_OPTIONS = {
+    zstd.CompressionParameter.compression_level: 3,
+    zstd.CompressionParameter.nb_workers: min(
+        os.cpu_count() or 1, zstd.CompressionParameter.nb_workers.bounds()[1]
+    ),
+}
+
 # Networks considered "private" for the purpose of default access control.
 # Connections from outside these ranges are rejected unless --public is given.
 # Covers: loopback, RFC 1918, CGNAT/Tailscale (100.64.0.0/10, RFC 6598),
@@ -60,6 +78,7 @@ class StageApp:
         self.console = Console()
         self.err_console = Console(stderr=True)
         self._config_cache = None
+        self._ssl_ctx_cache = None
         self._print_lock = threading.Lock()
 
     @property
@@ -70,6 +89,26 @@ class StageApp:
             with open(CONFIG_PATH, "rb") as f:
                 self._config_cache = tomllib.load(f)
         return self._config_cache
+
+    @property
+    def ssl_ctx(self):
+        if self._ssl_ctx_cache is None:
+            if not ssl.HAS_PSK:
+                self.die(
+                    "This Python's ssl module lacks TLS-PSK support,"
+                    " which stage needs for encrypted transfers."
+                )
+            self._ssl_ctx_cache = _client_ssl_ctx(self.config["stage"]["token"])
+        return self._ssl_ctx_cache
+
+    def _open(self, url, headers=None, data=None, method=None, timeout=10):
+        req = urllib_request.Request(
+            url, headers=headers or {}, data=data, method=method
+        )
+        return urllib_request.urlopen(req, timeout=timeout, context=self.ssl_ctx)
+
+    def _post(self, url, headers):
+        return self._open(url, headers=headers, data=b"", method="POST")
 
     def die(self, msg):
         self.err_console.print(f"[red]stage: {msg}[/red]")
@@ -191,14 +230,13 @@ class StageApp:
                 "Content-Type": "application/json",
             }
             body = json.dumps({"files": files}).encode()
-            req = urllib_request.Request(
-                f"http://127.0.0.1:{port}/amend",
-                headers=amend_headers,
-                data=body,
-                method="POST",
-            )
             try:
-                urllib_request.urlopen(req, timeout=10)
+                self._open(
+                    f"https://127.0.0.1:{port}/amend",
+                    headers=amend_headers,
+                    data=body,
+                    method="POST",
+                )
             except Exception as e:
                 self.die(f"Failed to amend active session: {e}")
             if not quiet:
@@ -211,9 +249,12 @@ class StageApp:
             return
 
         port = int(self.config["stage"].get("port", DEFAULT_PORT))
+        ssl_ctx = self.ssl_ctx  # fail early if TLS-PSK is unavailable
 
         STAGE_DIR.mkdir(parents=True, exist_ok=True)
-        MANIFEST_FILE.write_text(json.dumps({"files": files, "compress": compress}, indent=2))
+        MANIFEST_FILE.write_text(
+            json.dumps({"files": files, "compress": "zstd" if compress else False}, indent=2)
+        )
 
         proc = subprocess.Popen(
             [
@@ -232,10 +273,12 @@ class StageApp:
         PID_FILE.write_text(str(proc.pid))
 
         try:
-            for _ in range(20):
-                time.sleep(0.25)
+            for _ in range(100):
+                time.sleep(0.05)
                 try:
-                    urllib_request.urlopen(f"http://127.0.0.1:{port}/health", timeout=1)
+                    urllib_request.urlopen(
+                        f"https://127.0.0.1:{port}/health", timeout=1, context=ssl_ctx
+                    )
                     break
                 except Exception:
                     pass
@@ -251,7 +294,15 @@ class StageApp:
             # blocks the other. UPnP discovery typically takes ~500 ms.
             upnp_info = [None]
             pub_ip = [None]
+            ts_info = [(None, [])]
             bg = []
+            if not quiet:
+                t = threading.Thread(
+                    target=lambda: ts_info.__setitem__(0, _tailscale_info()),
+                    daemon=True,
+                )
+                t.start()
+                bg.append(t)
             if public:
                 t = threading.Thread(
                     target=lambda: upnp_info.__setitem__(0, _try_upnp_forward(port)),
@@ -289,7 +340,7 @@ class StageApp:
                         " will be accepted. Only use this on networks you trust.[/yellow]\n"
                     )
 
-                ts_ip, ts_peers = _tailscale_info()
+                ts_ip, _ts_peers = ts_info[0]
                 local_ips = [ip for ip in _local_ips() if ip != ts_ip]
 
                 if ts_ip:
@@ -371,6 +422,7 @@ class StageApp:
             ("0.0.0.0", port),
             _StagingHandler,
             token=token,
+            ssl_ctx=_server_ssl_ctx(token),
             entries=entries,
             entries_lock=entries_lock,
             compress=compress,
@@ -406,11 +458,18 @@ class StageApp:
         if host_arg:
             base = _base_url(host_arg, port)
             try:
-                req = urllib_request.Request(f"{base}/manifest", headers=headers)
-                resp = urllib_request.urlopen(req, timeout=PROBE_TIMEOUT)
+                resp = self._open(
+                    f"{base}/manifest", headers=headers, timeout=PROBE_TIMEOUT
+                )
                 return base, headers, json.loads(resp.read()), host_arg
-            except Exception:
+            except Exception as e:
                 if not quiet:
+                    if isinstance(getattr(e, "reason", e), ssl.SSLError):
+                        self.die(
+                            f"TLS handshake with {host_arg} failed. The tokens may"
+                            " differ, or the other machine runs an older stage"
+                            " (run 'stage update' on both)."
+                        )
                     self.die(f"No active session reachable at {host_arg}")
                 return None
 
@@ -434,10 +493,11 @@ class StageApp:
         def probe(ip):
             if found.is_set():
                 return
-            base = f"http://{ip}:{port}"
+            base = f"https://{ip}:{port}"
             try:
-                req = urllib_request.Request(f"{base}/manifest", headers=headers)
-                resp = urllib_request.urlopen(req, timeout=PROBE_TIMEOUT)
+                resp = self._open(
+                    f"{base}/manifest", headers=headers, timeout=PROBE_TIMEOUT
+                )
                 data = json.loads(resp.read())
                 with lock:
                     if result[0] is None:
@@ -481,10 +541,10 @@ class StageApp:
         ]
         if not file_entries:
             self.console.print("Nothing staged.")
-            _post(f"{base}/done", headers)
+            self._post(f"{base}/done", headers)
             return
 
-        from_label = source_label or base.removeprefix("http://")
+        from_label = source_label or base.removeprefix("https://")
         table = Table(show_header=False, box=None, padding=(0, 2))
         table.add_column()
         table.add_column(justify="right", style="cyan")
@@ -511,9 +571,15 @@ class StageApp:
             entry_type = entry.get("type", "file")
             encoded = quote(name, safe="")
             show_progress = not parallel
+            url = f"{base}/files/{encoded}"
             try:
-                req = urllib_request.Request(f"{base}/files/{encoded}", headers=headers)
-                resp = urllib_request.urlopen(req, timeout=300)
+                size = entry.get("size") or 0
+                if entry_type != "dir" and not compress and size >= RANGED_MIN_SIZE:
+                    self._download_ranged(
+                        url, headers, size, dest, name, show_progress=show_progress
+                    )
+                    return None
+                resp = self._open(url, headers=headers, timeout=300)
                 if entry_type == "dir":
                     # When compressed, we don't know the compressed size ahead of time,
                     # so suppress the total to avoid a misleading progress bar.
@@ -539,9 +605,15 @@ class StageApp:
                                     bar.update(len(chunk))
                                 return chunk
 
-                        tar_mode = "r|gz" if compress else "r|"
-                        with tempfile.TemporaryDirectory() as tmp_dir:
-                            with tarfile.open(fileobj=_Reader(), mode=tar_mode) as tar:
+                        src = _Reader()
+                        if compress:
+                            src = zstd.ZstdFile(src, "rb")
+                        # Extract beside the destination so the final move is a
+                        # rename rather than a cross-filesystem copy out of /tmp.
+                        with tempfile.TemporaryDirectory(
+                            dir=dest.parent, prefix=".stage-"
+                        ) as tmp_dir:
+                            with tarfile.open(fileobj=src, mode="r|") as tar:
                                 for member in tar:
                                     tar.extract(member, tmp_dir, filter=_tar_filter)
                                     if member.isfile():
@@ -563,10 +635,10 @@ class StageApp:
                     with self._print_lock:
                         self.console.print(f"  extracted [bold]{name}/[/bold]{rename}")
                 else:
-                    file_resp = gzip.GzipFile(fileobj=resp, mode="rb") if compress else resp
+                    file_resp = zstd.ZstdFile(resp, "rb") if compress else resp
                     self._download(file_resp, dest, name, show_progress=show_progress)
                 return None
-            except (URLError, OSError, tarfile.TarError) as e:
+            except (URLError, OSError, tarfile.TarError, zstd.ZstdError) as e:
                 return (name, e)
 
         n_workers = min(4, len(assignments))
@@ -587,7 +659,7 @@ class StageApp:
                 fut.cancel()
             executor.shutdown(wait=False, cancel_futures=True)
             try:
-                _post(f"{base}/cancel", headers)
+                self._post(f"{base}/cancel", headers)
             except Exception:
                 pass
             self.console.print("\n[yellow]Pull interrupted.[/yellow]")
@@ -596,7 +668,7 @@ class StageApp:
             executor.shutdown(wait=True)
 
         if not errors:
-            resp = _post(f"{base}/done", headers)
+            resp = self._post(f"{base}/done", headers)
             remaining = json.loads(resp.read()).get("pulls_remaining", 0)
             n = len(file_entries)
             suffix = (
@@ -630,12 +702,79 @@ class StageApp:
             file=sys.stderr,
             disable=not show_progress,
         ) as bar:
+            buf = memoryview(bytearray(CHUNK_SIZE))
             with open(dest, "wb") as f:
-                while chunk := resp.read(65536):
-                    f.write(chunk)
-                    bar.update(len(chunk))
-                    downloaded += len(chunk)
+                while n := resp.readinto(buf):
+                    f.write(buf[:n])
+                    bar.update(n)
+                    downloaded += n
 
+        self._report_download(name, dest, downloaded, start, suffix)
+
+    def _download_ranged(self, url, headers, size, dest, name, show_progress=True):
+        """Fetch a large file as parallel byte ranges over separate connections.
+
+        Each connection has its own TLS session, so decryption spreads across
+        cores and high-latency links get several TCP windows in flight.
+        """
+        n_parts = max(2, min(RANGED_MAX_PARTS, size // RANGED_PART_SIZE))
+        step = -(-size // n_parts)
+        spans = [(lo, min(lo + step, size) - 1) for lo in range(0, size, step)]
+        bar_lock = threading.Lock()
+        start = time.monotonic()
+
+        with open(dest, "wb") as f:
+            f.truncate(size)
+
+        with tqdm(
+            total=size,
+            unit="B",
+            unit_scale=True,
+            unit_divisor=1024,
+            desc=name,
+            ncols=80,
+            leave=False,
+            file=sys.stderr,
+            disable=not show_progress,
+        ) as bar:
+
+            def fetch_span(lo, hi):
+                resp = self._open(
+                    url, headers={**headers, "Range": f"bytes={lo}-{hi}"}, timeout=300
+                )
+                if resp.status != 206:
+                    resp.close()
+                    raise _RangeNotSupported
+                buf = memoryview(bytearray(CHUNK_SIZE))
+                remaining = hi - lo + 1
+                with open(dest, "r+b") as f:
+                    f.seek(lo)
+                    while remaining:
+                        n = resp.readinto(buf[: min(CHUNK_SIZE, remaining)])
+                        if not n:
+                            raise OSError(f"connection closed with {remaining} bytes left")
+                        f.write(buf[:n])
+                        remaining -= n
+                        with bar_lock:
+                            bar.update(n)
+
+            with ThreadPoolExecutor(max_workers=len(spans)) as ex:
+                futures = [ex.submit(fetch_span, lo, hi) for lo, hi in spans]
+                try:
+                    for fut in futures:
+                        fut.result()
+                except _RangeNotSupported:
+                    for fut in futures:
+                        fut.cancel()
+                    ex.shutdown(wait=True)
+                    bar.reset()
+                    resp = self._open(url, headers=headers, timeout=300)
+                    self._download(resp, dest, name, show_progress=show_progress)
+                    return
+
+        self._report_download(name, dest, size, start)
+
+    def _report_download(self, name, dest, downloaded, start, suffix=None):
         elapsed = max(time.monotonic() - start, 1e-9)
         speed = downloaded / elapsed
         if suffix is None:
@@ -969,7 +1108,7 @@ class StageApp:
             "      -n N       Allow N pulls (default 1)"
         )
         self.console.print(
-            "      -z         Compress transfer with gzip (slower CPU, less bandwidth)"
+            "      -z         Compress transfer with zstd (more CPU, less bandwidth)"
         )
         self.console.print(
             "      -q         Quiet: suppress output unless there is an error"
@@ -1008,12 +1147,28 @@ class StageApp:
 
 
 def _dir_stats(path: Path) -> tuple[int, int]:
-    """Return (total_bytes, file_count) via stat-only walk (no file reads)."""
+    """Return (total_bytes, file_count) via stat-only walk (no file reads).
+
+    Uses scandir's cached entry types, and does not follow symlinks, matching
+    what tarfile.add sends.
+    """
     size = count = 0
-    for f in path.rglob("*"):
-        if f.is_file():
-            size += f.stat().st_size
-            count += 1
+    stack = [str(path)]
+    while stack:
+        try:
+            it = os.scandir(stack.pop())
+        except OSError:
+            continue
+        with it:
+            for entry in it:
+                try:
+                    if entry.is_dir(follow_symlinks=False):
+                        stack.append(entry.path)
+                    elif entry.is_file(follow_symlinks=False):
+                        size += entry.stat(follow_symlinks=False).st_size
+                        count += 1
+                except OSError:
+                    pass
     return size, count
 
 
@@ -1151,9 +1306,52 @@ def _is_private_ip(addr: str) -> bool:
         return False
 
 
-def _post(url, headers):
-    req = urllib_request.Request(url, method="POST", headers=headers, data=b"")
-    return urllib_request.urlopen(req, timeout=10)
+class _RangeNotSupported(Exception):
+    pass
+
+
+def _psk_key(token: str) -> bytes:
+    # Derive the TLS pre-shared key from the token rather than using it raw.
+    return hmac.new(token.encode(), b"stage-tls-psk-v1", hashlib.sha256).digest()
+
+
+# TLS 1.2 fallback cipher: PSK with ECDHE and an AEAD, so sessions keep forward
+# secrecy. TLS 1.3 PSK uses (EC)DHE key exchange by default.
+_PSK_CIPHERS = "ECDHE-PSK-CHACHA20-POLY1305"
+
+
+def _server_ssl_ctx(token: str) -> ssl.SSLContext:
+    key = _psk_key(token)
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+    ctx.set_ciphers(_PSK_CIPHERS)
+    # An empty key for an unknown identity makes the handshake fail.
+    ctx.set_psk_server_callback(lambda ident: key if ident == _PSK_IDENTITY else b"")
+    return ctx
+
+
+def _client_ssl_ctx(token: str) -> ssl.SSLContext:
+    key = _psk_key(token)
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    # The shared key authenticates both sides; there are no certificates.
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+    ctx.set_ciphers(_PSK_CIPHERS)
+    ctx.set_psk_client_callback(lambda hint: (_PSK_IDENTITY, key))
+    return ctx
+
+
+def _parse_range(header: str, size: int) -> tuple[int, int] | None:
+    """Parse a single 'bytes=lo-hi' range. Returns (lo, hi) inclusive or None."""
+    m = re.fullmatch(r"bytes=(\d+)-(\d*)", header.strip())
+    if not m:
+        return None
+    lo = int(m.group(1))
+    hi = min(int(m.group(2)), size - 1) if m.group(2) else size - 1
+    if lo > hi:
+        return None
+    return lo, hi
 
 
 def _local_ips():
@@ -1186,8 +1384,8 @@ def _is_daemon_running():
 def _base_url(host_str, default_port):
     if ":" in host_str:
         h, p = host_str.rsplit(":", 1)
-        return f"http://{h}:{p}"
-    return f"http://{host_str}:{default_port}"
+        return f"https://{h}:{p}"
+    return f"https://{host_str}:{default_port}"
 
 
 def _unique_path(path):
@@ -1357,15 +1555,17 @@ class _StagingServer(ThreadingHTTPServer):
         RequestHandlerClass,
         *,
         token: str,
+        ssl_ctx: ssl.SSLContext,
         entries: dict,
         entries_lock: threading.Lock,
-        compress: bool,
+        compress: str | bool,
         pulls_remaining: list,
         done_event: threading.Event,
         public: bool,
     ):
         super().__init__(server_address, RequestHandlerClass)
         self.token = token
+        self.ssl_ctx = ssl_ctx
         self.entries = entries
         self.entries_lock = entries_lock
         self.compress = compress
@@ -1373,8 +1573,27 @@ class _StagingServer(ThreadingHTTPServer):
         self.done_event = done_event
         self.public = public
 
+    def finish_request(self, request, client_address):
+        # Runs in the per-connection thread, so a slow handshake cannot stall
+        # accept(). A client with the wrong token fails here and is dropped.
+        request.settimeout(10)
+        try:
+            tls = self.ssl_ctx.wrap_socket(request, server_side=True)
+        except (ssl.SSLError, OSError):
+            return
+        try:
+            tls.settimeout(300)
+            self.RequestHandlerClass(tls, client_address, self)
+        finally:
+            tls.close()
+
 
 class _StagingHandler(BaseHTTPRequestHandler):
+    # Buffer writes so tar's small blocks coalesce into large TLS records.
+    # (A large tarfile bufsize is slower: its stream buffer re-slices on
+    # every read.) StreamRequestHandler.finish() flushes this.
+    wbufsize = 256 << 10
+
     def log_message(self, format: str, *args) -> None:  # noqa: A002
         pass
 
@@ -1453,40 +1672,68 @@ class _StagingHandler(BaseHTTPRequestHandler):
 
     def _serve_dir(self, fp: Path) -> None:
         # Connection: close is required because Content-Length is unknown.
-        # compress=True uses gzip; default is uncompressed (fast LAN/VPN).
-        tar_mode = "w|gz" if self.server.compress else "w|"
+        # Default is uncompressed (fast LAN/VPN).
+        # compress uses multithreaded zstd; tarfile's own "w|zst" mode cannot
+        # take compressor options, so the zstd layer wraps the socket instead.
         self.send_response(200)
         self.send_header("Content-Type", "application/x-tar")
         self.send_header("Connection", "close")
         self.close_connection = True
         self.end_headers()
         try:
-            with tarfile.open(fileobj=self.wfile, mode=tar_mode) as tar:
+            if self.server.compress:
+                out = zstd.ZstdFile(self.wfile, "wb", options=_ZSTD_OPTIONS)
+            else:
+                out = self.wfile
+            with tarfile.open(fileobj=out, mode="w|") as tar:
                 tar.add(fp, arcname=fp.name)
+            if out is not self.wfile:
+                out.close()
         except OSError:
             # Covers client disconnect (BrokenPipeError, ConnectionResetError)
             # on both POSIX and Windows.
             pass
 
     def _serve_regular_file(self, fp: Path) -> None:
-        self.send_response(200)
+        size = fp.stat().st_size
+        lo, hi = 0, size - 1
+        range_header = self.headers.get("Range")
+        if range_header and not self.server.compress:
+            span = _parse_range(range_header, size)
+            if span is None:
+                self.send_response(416)
+                self.send_header("Content-Range", f"bytes */{size}")
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
+            lo, hi = span
+            self.send_response(206)
+            self.send_header("Content-Range", f"bytes {lo}-{hi}/{size}")
+        else:
+            self.send_response(200)
+            self.send_header("Accept-Ranges", "none" if self.server.compress else "bytes")
         self.send_header("Content-Type", "application/octet-stream")
         if self.server.compress:
             self.send_header("Connection", "close")
             self.close_connection = True
         else:
-            self.send_header("Content-Length", str(fp.stat().st_size))
+            self.send_header("Content-Length", str(hi - lo + 1))
         self.end_headers()
         try:
-            if self.server.compress:
-                with open(fp, "rb") as f:
-                    with gzip.GzipFile(fileobj=self.wfile, mode="wb") as gz:
-                        while chunk := f.read(65536):
-                            gz.write(chunk)
-            else:
-                with open(fp, "rb") as f:
-                    while chunk := f.read(65536):
-                        self.wfile.write(chunk)
+            with open(fp, "rb") as f:
+                if self.server.compress:
+                    with zstd.ZstdFile(self.wfile, "wb", options=_ZSTD_OPTIONS) as zf:
+                        shutil.copyfileobj(f, zf, CHUNK_SIZE)
+                else:
+                    f.seek(lo)
+                    buf = memoryview(bytearray(CHUNK_SIZE))
+                    remaining = hi - lo + 1
+                    while remaining:
+                        n = f.readinto(buf[: min(CHUNK_SIZE, remaining)])
+                        if not n:
+                            break
+                        self.wfile.write(buf[:n])
+                        remaining -= n
         except OSError:
             # Same as above; also covers TOCTOU FileNotFoundError.
             pass

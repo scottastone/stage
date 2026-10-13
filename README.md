@@ -1,6 +1,6 @@
 # stage
 
-A pull-based CLI file transfer tool for Tailscale networks and trusted LANs.
+A pull-based CLI file transfer tool for Tailscale networks and trusted LANs. Every transfer is encrypted, with or without Tailscale.
 
 ## The problem
 
@@ -52,7 +52,7 @@ uv tool install git+ssh://git@github.com/scottastone/stage && stage setup --toke
 stage report.pdf
 stage ~/Downloads/archive.zip ~/Documents/notes/
 stage -n 3 dataset.tar          # allow up to 3 pulls
-stage -z large-dir/             # compress transfer (less bandwidth, more CPU)
+stage -z large-dir/             # compress transfer with zstd (less bandwidth, more CPU)
 stage -q build-output/          # quiet: no output unless an error occurs
 stage --public large-file.iso   # accept connections from any IP (see Security)
 ```
@@ -82,7 +82,7 @@ stage pull 192.168.1.42             # direct IP
 stage pull 192.168.1.42:8000        # direct IP with custom port
 ```
 
-Files are saved to the current directory. If a file already exists, it is renamed (e.g., `report_1.pdf`) rather than overwritten. Directories are streamed as tar and extracted in place.
+Files are saved to the current directory. If a file already exists, it is renamed (e.g., `report_1.pdf`) rather than overwritten. Directories are streamed as tar and extracted in place. Files of 64 MB or more are downloaded as up to four parallel byte ranges, which spreads decryption across CPU cores and helps on high-latency links.
 
 By default, only one pull is allowed per session, after which the session is automatically terminated and the files are no longer available. This can be overridden with the `-n <number>` flag to allow multiple pulls per session.
 
@@ -111,6 +111,16 @@ stage provision                     # print a one-liner to configure a new machi
 
 ## Security
 
+### Encryption
+
+All traffic, including over Tailscale and on loopback, is carried over TLS 1.3 using a pre-shared key (TLS-PSK) derived from your shared token. This needs no certificates and no extra dependencies; it uses Python's built-in `ssl` module.
+
+- Files and the token are never sent in cleartext, so a plain LAN or an internet connection (`--public`, UPnP) is as private as Tailscale.
+- Both sides prove they know the token during the handshake. A machine with the wrong token, or a port scanner, fails the handshake and never reaches the HTTP layer.
+- The key exchange uses ephemeral (EC)DHE, so recorded traffic cannot be decrypted later even if the token leaks.
+
+Machines running a version of `stage` from before encryption was added cannot talk to newer ones. Run `stage update` on every machine.
+
 ### Default behavior: private networks only
 
 By default, `stage` only accepts connections from private IP ranges:
@@ -123,7 +133,7 @@ A connection from a public IP is rejected with 403 before authentication is even
 
 ### Token authentication
 
-Every request requires a `Bearer` token in the `Authorization` header. The token is a 32-character random hex string generated at setup and shared across your machines. Without it, the server returns 401. The token is stored in `~/.config/stage/config.toml`, which is written with `0600` permissions.
+The token is a 32-character random hex string generated at setup and shared across your machines. It is the source of the TLS key (see Encryption), and every request also carries it as a `Bearer` token in the `Authorization` header, inside the encrypted channel. The token is stored in `~/.config/stage/config.toml`, which is written with `0600` permissions.
 
 ### What happens if someone gets your token?
 
@@ -137,7 +147,7 @@ They cannot: execute code, write files, browse the filesystem beyond what is exp
 
 The blast radius is limited to whatever you have staged at that moment. Nothing is exposed between sessions.
 
-If you are on a Tailscale network and your Tailscale credentials are not compromised, this is not a practical attack -- the daemon is unreachable from the internet by default. The token matters most if you use `--public` on an untrusted network, in which case it is the only layer of authentication.
+If you are on a Tailscale network and your Tailscale credentials are not compromised, this is not a practical attack -- the daemon is unreachable from the internet by default. The token matters most if you use `--public` on an untrusted network, in which case it is the only layer of authentication. Because the token never crosses the network, it cannot be sniffed; it can only leak from a machine's config file.
 
 ### `--public` flag
 
@@ -147,11 +157,11 @@ By default, `stage` binds to all interfaces (`0.0.0.0`) but rejects connections 
 stage --public largefile.zip
 ```
 
-This prints a warning and enables connections from any source IP. Only use this on networks where you are comfortable with the token being the sole protection. On a home or office network with a properly configured NAT firewall, the risk is low. On open public Wi-Fi, it is not recommended.
+This prints a warning and enables connections from any source IP. Traffic is still encrypted, but only use this on networks where you are comfortable with the token being the sole protection. On a home or office network with a properly configured NAT firewall, the risk is low. On open public Wi-Fi, it is not recommended.
 
 ### Archive extraction safety
 
-Directories are transferred as tar streams (uncompressed by default, gzip with `-z`). Extraction uses `tarfile.data_filter` (Python 3.12+), which blocks path traversal attacks (e.g., `../../etc/passwd`). Absolute symlinks and symlinks pointing outside the destination are silently skipped. On Windows, entries matching reserved device names (CON, NUL, COM1-COM9, LPT1-LPT9) are also skipped.
+Directories are transferred as tar streams (uncompressed by default, multithreaded zstd with `-z`). Extraction uses `tarfile.data_filter` (Python 3.12+), which blocks path traversal attacks (e.g., `../../etc/passwd`). Absolute symlinks and symlinks pointing outside the destination are silently skipped. On Windows, entries matching reserved device names (CON, NUL, COM1-COM9, LPT1-LPT9) are also skipped.
 
 ## Compared to alternatives
 
@@ -167,6 +177,6 @@ The pull model is the key difference. The sender stages once; receivers pull at 
 
 ## Requirements
 
-- Python 3.12+
+- Python 3.14+ (with the standard OpenSSL-backed `ssl` module, which provides TLS-PSK)
 - [uv](https://github.com/astral-sh/uv) (for installation)
-- Tailscale (optional, but required for zero-config peer discovery)
+- Tailscale (optional, but required for zero-config peer discovery; not required for encryption)
