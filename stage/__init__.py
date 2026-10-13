@@ -48,6 +48,8 @@ RANGED_MIN_SIZE = 64 << 20
 RANGED_PART_SIZE = 32 << 20
 RANGED_MAX_PARTS = 4
 
+_ENABLE_PUBLIC_HINT = "enable them with 'stage setup' (or --allow-public)"
+
 _PSK_IDENTITY = "stage"
 _ZSTD_OPTIONS = {
     zstd.CompressionParameter.compression_level: 3,
@@ -89,6 +91,12 @@ class StageApp:
             with open(CONFIG_PATH, "rb") as f:
                 self._config_cache = tomllib.load(f)
         return self._config_cache
+
+    @property
+    def allow_public(self) -> bool:
+        """Master switch for anything that touches public addresses. Off unless
+        explicitly enabled in setup."""
+        return self.config["stage"].get("allow_public", False) is True
 
     @property
     def ssl_ctx(self):
@@ -185,6 +193,8 @@ class StageApp:
     # -------------------------------------------------------------------------
 
     def stage(self, paths, n=1, public=False, compress=False, quiet=False):
+        if public and not self.allow_public:
+            self.die(f"--public is disabled; {_ENABLE_PUBLIC_HINT}.")
         files = []
         for p in paths:
             path = Path(p).resolve()
@@ -222,7 +232,8 @@ class StageApp:
                 self.die(f"Not a file or directory: {p}")
 
         # If a session is already running, amend it rather than error out.
-        if _is_daemon_running():
+        daemon_pid = _daemon_pid()
+        if daemon_pid is not None:
             port = int(self.config["stage"].get("port", DEFAULT_PORT))
             token = self.config["stage"]["token"]
             amend_headers = {
@@ -238,15 +249,21 @@ class StageApp:
                     method="POST",
                 )
             except Exception as e:
-                self.die(f"Failed to amend active session: {e}")
-            if not quiet:
-                for f in files:
-                    indicator = "/" if f.get("type") == "dir" else ""
-                    self.console.print(
-                        f"Amended: [bold]{f['name']}{indicator}[/bold]"
-                        f"  [cyan]{_human_size(f['size'])}[/cyan]"
-                    )
-            return
+                # The session may have just ended (last pull done) and be
+                # shutting down. Wait for the process itself to exit so its
+                # cleanup cannot delete the new session's files or UPnP mapping.
+                if not _wait_for_exit(daemon_pid, timeout=5):
+                    self.die(f"Failed to amend active session: {e}")
+                daemon_pid = None
+            if daemon_pid is not None:
+                if not quiet:
+                    for f in files:
+                        indicator = "/" if f.get("type") == "dir" else ""
+                        self.console.print(
+                            f"Amended: [bold]{f['name']}{indicator}[/bold]"
+                            f"  [cyan]{_human_size(f['size'])}[/cyan]"
+                        )
+                return
 
         port = int(self.config["stage"].get("port", DEFAULT_PORT))
         ssl_ctx = self.ssl_ctx  # fail early if TLS-PSK is unavailable
@@ -310,7 +327,7 @@ class StageApp:
                 )
                 t.start()
                 bg.append(t)
-            if self.config["stage"].get("public_ip_check"):
+            if self.allow_public and self.config["stage"].get("public_ip_check"):
                 t = threading.Thread(
                     target=lambda: pub_ip.__setitem__(0, _public_ip()), daemon=True
                 )
@@ -403,6 +420,8 @@ class StageApp:
 
     def _run_daemon(self, port, n, public=False):
         token = self.config["stage"]["token"]
+        # Enforce the setting here too, in case _serve is invoked directly.
+        public = public and self.allow_public
         manifest = json.loads(MANIFEST_FILE.read_text())
         compress = manifest.get("compress", False)
         entries = {f["name"]: f for f in manifest["files"]}
@@ -436,6 +455,9 @@ class StageApp:
             done_event.wait()
         finally:
             server.shutdown()
+            # Close the listener so new connections are refused immediately
+            # instead of queueing until the process exits.
+            server.server_close()
             MANIFEST_FILE.unlink(missing_ok=True)
             PID_FILE.unlink(missing_ok=True)
             if UPNP_FILE.exists():
@@ -456,7 +478,24 @@ class StageApp:
         headers = {"Authorization": f"Bearer {token}"}
 
         if host_arg:
-            base = _base_url(host_arg, port)
+            try:
+                host, host_port = _split_host_port(host_arg, port)
+            except ValueError:
+                self.die(f"Invalid host: {host_arg}")
+            try:
+                ip = _resolve_allowed(host, host_port, self.allow_public)
+            except _PublicNotAllowed as e:
+                self.die(
+                    f"{host_arg} is a public address ({e}). Public connections"
+                    f" are disabled; {_ENABLE_PUBLIC_HINT}"
+                )
+            except OSError:
+                if not quiet:
+                    self.die(f"Could not resolve {host}")
+                return None
+            base = f"https://{_url_host(ip)}:{host_port}"
+            if ip != host:
+                host_arg = f"{host_arg} ({ip})"
             try:
                 resp = self._open(
                     f"{base}/manifest", headers=headers, timeout=PROBE_TIMEOUT
@@ -475,8 +514,8 @@ class StageApp:
 
         _local_ip, ts_peers = _tailscale_info()
         hostname_map = {ip: hostname for ip, hostname in ts_peers}
-        extra_ips = _load_peers()
-        all_peers = [ip for ip, _ in ts_peers] + extra_ips
+        extra_peers = _load_peers()
+        all_peers = [ip for ip, _ in ts_peers] + extra_peers
 
         if not all_peers:
             if not quiet:
@@ -487,13 +526,23 @@ class StageApp:
             return None
 
         result = [None]
+        blocked = []
         lock = threading.Lock()
         found = threading.Event()
 
-        def probe(ip):
+        def probe(peer):
             if found.is_set():
                 return
-            base = f"https://{ip}:{port}"
+            try:
+                host, host_port = _split_host_port(peer, port)
+                ip = _resolve_allowed(host, host_port, self.allow_public)
+            except _PublicNotAllowed:
+                with lock:
+                    blocked.append(peer)
+                return
+            except (OSError, ValueError):
+                return
+            base = f"https://{_url_host(ip)}:{host_port}"
             try:
                 resp = self._open(
                     f"{base}/manifest", headers=headers, timeout=PROBE_TIMEOUT
@@ -501,7 +550,9 @@ class StageApp:
                 data = json.loads(resp.read())
                 with lock:
                     if result[0] is None:
-                        hostname = hostname_map.get(ip, "")
+                        hostname = hostname_map.get(ip) or (
+                            host if host != ip else ""
+                        )
                         label = f"{hostname} ({ip})" if hostname else ip
                         result[0] = (base, headers, data, label)
                         found.set()
@@ -517,9 +568,14 @@ class StageApp:
 
         if result[0] is None:
             if not quiet:
+                skipped = (
+                    f"\nSkipped public peers: {', '.join(blocked)} ({_ENABLE_PUBLIC_HINT})"
+                    if blocked
+                    else ""
+                )
                 self.die(
                     "No active staging session found on any reachable peer.\n"
-                    "For a direct connection: stage pull <host>[:<port>]"
+                    "For a direct connection: stage pull <host>[:<port>]" + skipped
                 )
             return None
         return result[0]
@@ -821,6 +877,9 @@ class StageApp:
             _proc_terminate(pid)
         except OSError:
             pass
+        # Wait so the port and UPnP mapping are released before we return;
+        # otherwise an immediate re-stage can fail to bind.
+        _wait_for_exit(pid, timeout=5)
         PID_FILE.unlink(missing_ok=True)
         MANIFEST_FILE.unlink(missing_ok=True)
         self.console.print("Staging session cleared.")
@@ -839,7 +898,7 @@ class StageApp:
             self._peers_remove(args[1])
         else:
             self.console.print(
-                "Usage: stage peers [add <ip> | remove <ip>]"
+                "Usage: stage peers [add <host> | remove <host>]", markup=False
             )
 
     def _peers_list(self):
@@ -859,28 +918,59 @@ class StageApp:
 
         if extra:
             self.console.print("\nConfigured extra peers:")
-            for ip in extra:
-                tag = " [yellow](public)[/yellow]" if not _is_private_ip(ip) else ""
-                self.console.print(f"  {ip}{tag}")
+            for peer in extra:
+                self.console.print(f"  {peer}{self._peer_tag(peer)}")
         elif not ts_peers:
             self.console.print(
                 "\nNo extra peers configured. Use 'stage peers add <ip>' to add one."
             )
 
-    def _peers_add(self, ip: str):
+    def _peer_tag(self, peer: str) -> str:
+        port = int(self.config["stage"].get("port", DEFAULT_PORT))
+        try:
+            host, host_port = _split_host_port(peer, port)
+            ip = _resolve_allowed(host, host_port, allow_public=True)
+        except (OSError, ValueError):
+            return " [dim](does not resolve right now)[/dim]"
+        resolved = f" [dim]-> {ip}[/dim]" if ip != host else ""
+        if _is_private_ip(ip):
+            return resolved
+        if self.allow_public:
+            return f"{resolved} [yellow](public)[/yellow]"
+        return f"{resolved} [red](public, blocked)[/red]"
+
+    def _peers_add(self, peer: str):
         existing = _load_peers()
-        if ip in existing:
-            self.console.print(f"{ip} is already in the peer list.")
+        if peer in existing:
+            self.console.print(f"{peer} is already in the peer list.")
             return
-        if not _is_private_ip(ip):
-            self.console.print(
-                f"[yellow]Warning: {ip} appears to be a public IP address.[/yellow]\n"
-                "Connections to this peer will bypass private-network restrictions.\n"
-                "Make sure you trust this host and its network."
+        port = int(self.config["stage"].get("port", DEFAULT_PORT))
+        try:
+            host, host_port = _split_host_port(peer, port)
+        except ValueError:
+            self.die(f"Invalid peer: {peer}")
+        try:
+            ip = _resolve_allowed(host, host_port, self.allow_public)
+        except _PublicNotAllowed as e:
+            self.die(
+                f"{peer} is a public address ({e}). Public connections are"
+                f" disabled; {_ENABLE_PUBLIC_HINT}."
             )
-        existing.append(ip)
+        except OSError:
+            # Common for VPN hostnames while disconnected; checked at each pull.
+            self.console.print(
+                f"[dim]{host} does not resolve right now; it will be checked"
+                " on each pull.[/dim]"
+            )
+        else:
+            if not _is_private_ip(ip):
+                self.console.print(
+                    f"[yellow]Warning: {peer} is a public address ({ip}).[/yellow]\n"
+                    "Make sure you trust this host and its network."
+                )
+        existing.append(peer)
         _save_peers(existing)
-        self.console.print(f"Added {ip} to peer list.")
+        self.console.print(f"Added {peer} to peer list.")
 
     def _peers_remove(self, ip: str):
         existing = _load_peers()
@@ -900,6 +990,7 @@ class StageApp:
         provided_port = None
         provided_repo = None
         provided_public_ip = None
+        provided_allow_public = None
         args = list(extra_args or [])
         i = 0
         while i < len(args):
@@ -917,6 +1008,12 @@ class StageApp:
                 i += 2
             elif args[i] == "--public-ip":
                 provided_public_ip = True
+                i += 1
+            elif args[i] == "--allow-public":
+                provided_allow_public = True
+                i += 1
+            elif args[i] == "--no-allow-public":
+                provided_allow_public = False
                 i += 1
             else:
                 self.die(f"Unknown argument: {args[i]}")
@@ -969,8 +1066,27 @@ class StageApp:
         else:
             repo = existing_cfg.get("repo", "")
 
+        if provided_allow_public is not None:
+            allow_public = provided_allow_public
+        elif not non_interactive:
+            current = existing_cfg.get("allow_public", False) is True
+            default = "Y/n" if current else "y/N"
+            ans = (
+                input(
+                    "Allow connections over the public internet"
+                    f" (--public, UPnP, public peers)? [{default}]: "
+                )
+                .strip()
+                .lower()
+            )
+            allow_public = (ans == "y") if ans else current
+        else:
+            allow_public = existing_cfg.get("allow_public", False) is True
+
         if provided_public_ip is not None:
             public_ip_check = provided_public_ip
+        elif not allow_public:
+            public_ip_check = existing_cfg.get("public_ip_check", False)
         elif not non_interactive:
             current = existing_cfg.get("public_ip_check", False)
             default = "Y/n" if current else "y/N"
@@ -985,8 +1101,10 @@ class StageApp:
 
         repo_line = f'\nrepo = "{repo}"' if repo else ""
         pub_line = "\npublic_ip_check = true" if public_ip_check else ""
+        allow_line = "\nallow_public = true" if allow_public else ""
         CONFIG_PATH.write_text(
-            f'[stage]\nport = {port}\ntoken = "{token}"{repo_line}{pub_line}\n'
+            f'[stage]\nport = {port}\ntoken = "{token}"'
+            f"{repo_line}{pub_line}{allow_line}\n"
         )
         CONFIG_PATH.chmod(0o600)
         print(f"Config saved to {CONFIG_PATH}")
@@ -996,6 +1114,8 @@ class StageApp:
             pub_flag = " --public-ip" if public_ip_check else ""
             print("\nTo configure another machine:")
             print(f"  stage setup --token {token} --port {port}{repo_flag}{pub_flag}")
+            if allow_public:
+                print("  (public connections are enabled per machine: add --allow-public)")
 
     def update(self):
         state = _load_update_state()
@@ -1114,7 +1234,8 @@ class StageApp:
             "      -q         Quiet: suppress output unless there is an error"
         )
         self.console.print(
-            "      --public   Accept connections from any IP (default: private/Tailscale only)"
+            "      --public   Accept connections from any IP (default: private/Tailscale"
+            " only). Requires public connections to be enabled in setup"
         )
         self.console.print("")
         self.console.print(
@@ -1124,7 +1245,7 @@ class StageApp:
             "  stage status [<host>[:<port>]]     Show what is staged and where"
         )
         self.console.print(
-            "  stage peers [add|remove <ip>]      List or manage discoverable peers",
+            "  stage peers [add|remove <host>]    List or manage discoverable peers",
             markup=False,
         )
         self.console.print(
@@ -1137,7 +1258,8 @@ class StageApp:
             "  stage provision                    Print one-liner to configure a new machine"
         )
         self.console.print(
-            "  stage setup                        Configure port, token, and repo"
+            "  stage setup                        Configure port, token, repo, and"
+            " public access (off by default)"
         )
 
 
@@ -1371,21 +1493,64 @@ def _public_ip():
         return None
 
 
-def _is_daemon_running():
-    if not PID_FILE.exists():
-        return False
+def _daemon_pid() -> int | None:
+    """Return the PID of the running daemon, or None."""
     try:
         pid = int(PID_FILE.read_text().strip())
-        return _proc_alive(pid)
     except (OSError, ValueError):
-        return False
+        return None
+    return pid if _proc_alive(pid) else None
 
 
-def _base_url(host_str, default_port):
-    if ":" in host_str:
-        h, p = host_str.rsplit(":", 1)
-        return f"https://{h}:{p}"
-    return f"https://{host_str}:{default_port}"
+def _is_daemon_running():
+    return _daemon_pid() is not None
+
+
+def _wait_for_exit(pid: int, timeout: float) -> bool:
+    deadline = time.monotonic() + timeout
+    while _proc_alive(pid):
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.05)
+    return True
+
+
+def _split_host_port(host_str: str, default_port: int) -> tuple[str, int]:
+    """Parse 'host', 'host:port', '[v6]', '[v6]:port', or a bare IPv6 address."""
+    if host_str.startswith("["):
+        host, _, rest = host_str[1:].partition("]")
+        return host, int(rest[1:]) if rest.startswith(":") else default_port
+    if host_str.count(":") == 1:
+        host, port = host_str.split(":")
+        return host, int(port)
+    return host_str, default_port
+
+
+class _PublicNotAllowed(Exception):
+    pass
+
+
+def _resolve_allowed(host: str, port: int, allow_public: bool) -> str:
+    """Resolve host to one IP address that policy permits connecting to.
+
+    Without allow_public, only private addresses qualify. The caller connects
+    to the returned IP, so a DNS answer cannot change between check and use.
+    Raises OSError if the name does not resolve and _PublicNotAllowed if it
+    resolves only to public addresses.
+    """
+    infos = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+    # The daemon listens on IPv4 only, so try IPv4 first.
+    addrs = sorted(
+        dict.fromkeys(info[4][0] for info in infos), key=lambda a: ":" in a
+    )
+    allowed = [a for a in addrs if allow_public or _is_private_ip(a)]
+    if not allowed:
+        raise _PublicNotAllowed(addrs[0] if addrs else host)
+    return allowed[0]
+
+
+def _url_host(ip: str) -> str:
+    return f"[{ip}]" if ":" in ip else ip
 
 
 def _unique_path(path):

@@ -35,7 +35,7 @@ uv tool install git+ssh://git@github.com/scottastone/stage
 stage setup
 ```
 
-`setup` prompts for a port (default 47200), generates a shared token, and optionally configures update checks. Run the same command on each machine that will send or receive -- use `stage provision` to print a one-liner that configures a new machine with the same token.
+`setup` prompts for a port (default 47200), generates a shared token, optionally configures update checks, and asks whether to allow public internet connections (off by default; see Security). Run the same command on each machine that will send or receive -- use `stage provision` to print a one-liner that configures a new machine with the same token.
 
 An example provision output might look like:
 
@@ -54,7 +54,7 @@ stage ~/Downloads/archive.zip ~/Documents/notes/
 stage -n 3 dataset.tar          # allow up to 3 pulls
 stage -z large-dir/             # compress transfer with zstd (less bandwidth, more CPU)
 stage -q build-output/          # quiet: no output unless an error occurs
-stage --public large-file.iso   # accept connections from any IP (see Security)
+stage --public large-file.iso   # accept connections from any IP (must be enabled in setup; see Security)
 ```
 
 After staging, `stage` prints the available pull addresses:
@@ -88,16 +88,17 @@ By default, only one pull is allowed per session, after which the session is aut
 
 ### Manage peers
 
-By default, `stage pull` probes all online Tailscale peers. You can also add peers by IP for machines not on Tailscale or on a different network:
+By default, `stage pull` probes all online Tailscale peers. You can also add peers by IP or hostname for machines not on Tailscale. Hostnames are looked up on every pull, which suits networks such as corporate VPNs where a machine's name stays fixed but its IP changes:
 
 ```
 stage peers                     # list Tailscale peers and any configured extras
 stage peers add 192.168.1.50    # add a peer by IP
-stage peers add 203.0.113.5     # add a public IP (shows a warning)
+stage peers add build-box.corp.example.com   # add a peer by hostname
+stage peers add 203.0.113.5     # public address: refused unless public connections are enabled
 stage peers remove 192.168.1.50 # remove a peer
 ```
 
-Extra peers are stored in `~/.stage/peers.json` and probed alongside Tailscale peers on every `stage pull`.
+Extra peers are stored in `~/.stage/peers.json` and probed alongside Tailscale peers on every `stage pull`. `stage pull <hostname>` also works for a one-off pull.
 
 ### Other commands
 
@@ -149,9 +150,19 @@ The blast radius is limited to whatever you have staged at that moment. Nothing 
 
 If you are on a Tailscale network and your Tailscale credentials are not compromised, this is not a practical attack -- the daemon is unreachable from the internet by default. The token matters most if you use `--public` on an untrusted network, in which case it is the only layer of authentication. Because the token never crosses the network, it cannot be sniffed; it can only leak from a machine's config file.
 
+### Public connections (off by default)
+
+Everything that involves the public internet is disabled until you enable it on that machine, either by answering yes in `stage setup` or with `stage setup ... --allow-public`. This sets `allow_public = true` in the config. While it is off:
+
+- `stage --public` is refused, so the daemon never accepts public connections and UPnP never opens a port. The daemon also re-checks the setting itself.
+- Your public IP is never looked up or displayed.
+- `stage pull` and `stage peers add` refuse hosts that resolve only to public addresses. Hostnames are resolved first, and the pull connects to the address that passed the check.
+
+`stage provision` deliberately does not copy this setting to new machines; each machine opts in on its own. Use `--no-allow-public` to turn it off again.
+
 ### `--public` flag
 
-By default, `stage` binds to all interfaces (`0.0.0.0`) but rejects connections from public IPs at the application layer. If you want to stage for someone outside your private network:
+By default, `stage` binds to all interfaces (`0.0.0.0`) but rejects connections from public IPs at the application layer. If public connections are enabled and you want to stage for someone outside your private network:
 
 ```
 stage --public largefile.zip
